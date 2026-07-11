@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "编译 (make)",
+      "type": "shell",
+      "command": "make -j",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"],
+      "detail": "编译工程，等同 Keil 的 Build"
+    },
+    {
+      "label": "清理 (make clean)",
+      "type": "shell",
+      "command": "make clean",
+      "problemMatcher": [],
+      "detail": "删除 build 产物，等同 Keil 的 Clean"
+    },
+    {
+      "label": "烧录到板子 (st-flash)",
+      "type": "shell",
+      "command": "make -j && st-flash --reset write build/f407-eth-test.bin 0x08000000",
+      "problemMatcher": [],
+      "detail": "先编译再烧录，等同 Keil 的 Download。烧完按板子复位键运行"
+    }
+  ]
+}

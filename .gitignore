@@ -1,0 +1,22 @@
+# Build output
+build/
+*.o
+*.d
+*.lst
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.cyclo
+
+# IDE / local
+.vscode/*.log
+*.user
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
