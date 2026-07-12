@@ -121,13 +121,29 @@ static inline void heartbeat(void)
    if (++n >= 125) { n = 0; GPIOF->ODR ^= GPIO_PIN_9; }
 }
 
-/* 一个通信周期: 发+收过程数据, 固定4ms节拍 */
+/* 一个通信周期: 发+收过程数据, 固定4ms节拍。
+ * 节拍对齐用绝对时刻(next_deadline每次只加4ms, 不受本轮实际耗时影响),
+ * 不能用osal_usleep(相对延时) —— 那样真实周期会变成"4ms+本轮EtherCAT收发耗时",
+ * 且逐帧抖动, 而vel_closed()里的位置积分(cmd_pos += v_ff*DT)是按严格4ms算的,
+ * 周期一旦漂移/抖动, 闭环用来对比的"期望位置"就会跟伺服真实走的对不上,
+ * P环持续误纠正, 表现为运动发飘/发抖(对齐PC端clock_nanoseep(TIMER_ABSTIME)的做法)。 */
 static void cycle(void)
 {
+   static ec_timet next_deadline;
+   static int inited = 0;
+
    ecx_send_processdata(&ctx);
    g_wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
    heartbeat();
-   osal_usleep(CYC_US);
+
+   if (!inited) { osal_get_monotonic_time(&next_deadline); inited = 1; }
+
+   next_deadline.tv_nsec += (long)CYC_US * 1000L;
+   while (next_deadline.tv_nsec >= 1000000000L) {
+      next_deadline.tv_sec++;
+      next_deadline.tv_nsec -= 1000000000L;
+   }
+   osal_monotonic_sleep(&next_deadline);
 }
 
 /* ================= 串口命令解析 ================= */
