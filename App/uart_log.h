@@ -12,6 +12,9 @@ extern "C" {
 void uart_log_init(void);
 void uart_log(const char *fmt, ...);
 
+/* 非阻塞收一个字节: 有数据返回0~255, 无数据返回-1。用于接收外部命令。 */
+int  uart_rx_getc(void);
+
 #ifdef __cplusplus
 }
 #endif

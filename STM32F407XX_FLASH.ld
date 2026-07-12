@@ -56,7 +56,7 @@ ENTRY(Reset_Handler)
 _estack = ORIGIN(RAM) + LENGTH(RAM);    /* end of RAM */
 _sstack = _estack - _Min_Stack_Size;
 /* Generate a link error if heap and stack don't fit into RAM */
-_Min_Heap_Size = 0x200;      /* required amount of heap  */
+_Min_Heap_Size = 0x800;      /* required amount of heap (USB设备库枚举时用malloc分配字符串描述符缓冲) */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Specify the memory areas */

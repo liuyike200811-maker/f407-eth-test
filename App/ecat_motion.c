@@ -1,64 +1,94 @@
 /*
- * 最简 EtherCAT 运动控制 —— STM32 板上 SOEM
- *   流程: 扫从站 → 配 CSV 的 PDO → 进OP → CiA402使能 → 伸出/缩回 × 5 → 保持
- *   控制: CSV(速度模式,6060=9), 位置反馈用 6063(CSV下6064恒为0), 简单P速度环
- *   已刻意砍掉: 模式切换/FK/DC-PI同步/E-101等防护/诊断打印 —— 先跑通再说
+ * EtherCAT 三轴康复运动控制 —— STM32 板上 SOEM (CSV 模式, 命令驱动)
+ * ================================================================
+ * 架构: 开机→扫从站→配CSV的PDO→进OP→使能→[待机]→听串口命令→跑模式→回待机
  *
- *   ⚠ 未做 DC 同步(SYNC0)。信捷 DS5C1 在 CSV 下通常可自由运行(free-run);
- *     若上电后从站报 E-810/E-812 之类时钟类报警, 需要再补 DC(ecx_configdc+dcsync0)。
+ * 控制: CSV(速度模式, 6060=9)。位置反馈用 6063(CSV下6064恒为0, 见记忆),
+ *       每轴 前馈速度 + 位置P闭环(带编码器方向自动锁定), 防漂移/防接反跑飞。
+ *
+ * 6个模式(全部CSV, 均为 上升→运动→下降 三段, 归零除外):
+ *   0 综合波浪   1 跖屈/背伸   2 内翻/外翻   3 环形   4 8字      5 归零(堵转检测)
+ *   1~4 走 3-RPS 正解(FK): 踝角(α内翻外翻, β跖屈背伸)→三电缸长度→速度。
+ *
+ * 串口命令 (USART1/CH340 115200 或 USB Slave/Micro-USB虚拟串口, 二选一或都行, 行末\r或\n):
+ *   ?          查看状态/帮助
+ *   h          归零(收回到机械限位)
+ *   g<n>       运行模式 n (0波浪 1跖背 2内外 3环形 4八字)
+ *   x          急停(停止当前运动, 平滑降速回待机)
+ *   q          下电退出(脱力→退INIT, 之后可安全断电/拔网线)
+ *   a<度> b<度>  设 α / β 幅度(度)     f<厘赫> 设频率(25=0.25Hz)
+ *   w<mm>      设波浪幅度              r<mm> 设上升高度   c<次> 设运动循环数
+ *
+ * ⚠ 未做 DC 同步, 信捷 DS5C1 在 CSV 下自由运行(free-run)。实测单轴最大行程
+ *   约159mm(见探测标定), 上升高度+运动幅度务必留余量; 建议每次运动前先 h 归零。
  */
 #include "soem/soem.h"
 #include "ecat_motion.h"
 #include "uart_log.h"
+#include "usbd_cdc_if.h"
 #include "osal.h"
+#include "stm32f4xx_hal.h"   /* 心跳灯(GPIOF/PF9)直接寄存器访问用 */
 #include <string.h>
+#include <math.h>
 
 volatile int g_ec_slavecount = 0;
 volatile int g_ec_phase = 0;
 volatile int g_ec_fault = 0;
+volatile unsigned int g_reset_cause = 0;
 
 static ecx_contextt ctx;
 static uint8 IOmap[256];
 
-/* ---- 运动参数(最简, 想改就改这几个) ---- */
-#define LEAD_MM       3.0        /* 丝杠导程 mm/圈 */
-#define PULSE_PER_REV 131072.0   /* 编码器 脉冲/圈 */
-#define ROD_MM        80.0       /* 每次伸出的杆长 mm (实测三轴最大行程均值159.65mm, 这里约留一半余量) */
-#define ROD_PULSE     ((int32_t)(ROD_MM * PULSE_PER_REV / LEAD_MM))
-#define CYCLES        5          /* 往复次数 */
-#define CYC_US        2000       /* 通信周期 2ms */
-#define VMAX          568000     /* 速度上限 pulse/s (≈13mm/s) */
-#define KP            3          /* 位置->速度 比例增益 */
-#define DEADBAND      500        /* 到位死区 pulse */
-#define MAX_CYC_PHASE 8000       /* 单个伸/缩阶段最多跑多少周期(超时保护, 行程变大相应放宽) */
-#define START_DELAY_S 5          /* 使能伺服前的倒计时(秒), 留时间让人离开机构 */
+/* ---- 机械/编码器常量 ---- */
+#define LEAD_MM        3.0          /* 丝杠导程 mm/圈 */
+#define PULSE_PER_REV  131072.0     /* 编码器 脉冲/圈 (17位) */
+#define MM_PER_PULSE   (LEAD_MM / PULSE_PER_REV)
+#define CSV_MODE       9
+#define DT             0.004        /* 通信周期 4ms (与PC端轨迹常量一致) */
+#define CYC_US         4000
 
-/* ---- 一次性标定: 探测三轴各自的最大可伸出量 ----
- * 改成1编译烧录, 单独跑一次探测, 记下日志里每轴的最大行程和三轴平均值,
- * 测完改回0, 用测出来的数据设置正式的 ROD_MM。
- * 没有硬件限位开关, 只能靠软件判断"顶到头了": 慢慢推, 若一段时间
- * (STALL_WINDOW_CYC个周期)位置几乎不再前进就判定该轴到极限、立刻停该轴,
- * 其余轴继续探测直到各自都停下, 避免某条腿先卡死、其余两条还在硬顶导致
- * 并联平台被扭。ABS_MAX_MM是保险丝, 万一失速判断失效也不会无限往前冲。
- * 第一次探测(0~150mm, 慢速)已经整段跑通、没有任何异常/报警, 说明这一段
- * 机械上是空的, 之后同样的行程可以用正常速度快速通过, 只在没验证过的
- * 未知地带(>150mm)才继续用慢速摸。 */
-#define PROBE_MAX_STROKE  0      /* 已测完: 三轴均值159.65mm(159.70/159.54/159.70), 关掉探测模式 */
-#define PROBE_FAST_MM     150.0        /* 已验证空段的终点: 用正常速度快速通过 */
-#define PROBE_FAST_PULSE  ((int32_t)(PROBE_FAST_MM * PULSE_PER_REV / LEAD_MM))
-#define PROBE_VMAX_FAST   VMAX         /* 已知安全段用正常速度(≈9mm/s) */
-#define PROBE_VMAX_SLOW   (VMAX / 8)   /* 未知地带用慢速(≈1.1mm/s), 减小顶到硬止点的冲击 */
-#define STALL_WINDOW_CYC  250          /* 判定失速的采样窗口(≈0.5s @2ms周期) */
-#define STALL_EPS_PULSE   2000         /* 窗口内位置变化小于此值判定为失速 */
-#define ABS_MAX_MM        250.0        /* 软件硬顶, 没实测行程前留够余量的保险丝, 到了强制停
-                                           (第一次探测150mm三轴全都撞了硬顶, 没测到真失速, 说明
-                                           实际行程≥150mm, 调大到250再探一次) */
-#define ABS_MAX_PULSE     ((int32_t)(ABS_MAX_MM * PULSE_PER_REV / LEAD_MM))
-#define PROBE_TIMEOUT_CYC 200000       /* 探测总超时(≈400s), 兜底防止死循环 */
+/* ---- 闭环控制常量(与PC端 test_xinje_csv_wave_v2 对齐) ---- */
+#define KP_POS         8.0          /* 位置环增益 1/s */
+#define VMAX           (600.0/60.0*PULSE_PER_REV)   /* 速度上限 ≈600RPM */
+#define AMAX           (VMAX/0.15)  /* 加速度上限, ~0.15s达满速 */
+#define LPF_TAU        0.15         /* 纠正量低通时间常数 s */
+#define DEADBAND       300.0        /* 位置误差死区 pulse */
+#define SIGN_LOCK_PULSE 20000.0     /* 上升位移累计超此值即锁定反馈方向 */
+#define RAMP_FRAMES    150          /* 上升/下降加减速帧数 */
 
-#define CSV_MODE 9
+/* ---- 归零(堵转检测, 与PC端 retract_all 对齐) ---- */
+#define RETRACT_VEL    (-163840)    /* 收缩速度 pulse/s (≈-75RPM) */
+#define STALL_THR      8000         /* |实际速度|低于此值算堵转 pulse/s */
+#define STALL_FRAMES   50           /* 连续多少帧堵转判定到位(≈200ms) */
+#define HOME_MAX_FRAMES 7500        /* 归零超时(≈30s) */
 
-static int32_t start_pos[EC_MAXSLAVE];
+/* ---- 可由串口命令修改的运动参数(带安全默认值) ---- */
+static int    g_aa_deg   = 15;      /* α 幅度(度) */
+static int    g_ba_deg   = 15;      /* β 幅度(度) */
+static int    g_freq_cHz = 25;      /* 频率(厘赫兹) 25=0.25Hz */
+static int    g_wave_mm  = 30;      /* 波浪幅度 mm (mode0) */
+static int    g_rise_mm  = 60;      /* 上升高度 mm */
+static int    g_rise_rpm = 150;     /* 上升速度 RPM */
+static int    g_cycles   = 9;       /* 运动循环数 */
+
+#define WAVE_PEAK_RPM  471.0        /* 波浪峰值速度(mode0) */
+#define FK_Z0          380.0        /* FK 归位参考工作高度 mm */
+
+/* ---- 闭环状态(每轴) ---- */
+static int32_t start_pos[EC_MAXSLAVE];   /* 运动起点编码器零点(6063) */
+static double  cmd_pos[EC_MAXSLAVE];     /* 期望位置=前馈速度积分 */
+static double  v_last[EC_MAXSLAVE];      /* 上帧命令速度, 限加速度用 */
+static double  corr_filt[EC_MAXSLAVE];   /* 低通后的纠正量 */
+static int     fb_sign[EC_MAXSLAVE];     /* 反馈方向: 0待锁 ±1已锁 */
+static const double PHASE[4] = {0.0, 0.0, 2.0*M_PI/3.0, 4.0*M_PI/3.0};  /* 三轴波浪相位(索引1~3) */
+
+/* ---- 命令状态 ---- */
+static volatile int g_run_request = -1;  /* -1无; 0~4运行对应模式 */
+static volatile int g_do_home     = 0;
+static volatile int g_quit        = 0;
+static volatile int g_abort       = 0;   /* 运动中急停标志 */
+
+static volatile int g_wkc = 0;
 
 /* ---- PDO 字节访问 (RxPDO: CW+mode+60FF; TxPDO: SW+mode+6063+606C) ---- */
 static inline void write_pdo(int sl, uint16_t cw, int32_t vel)
@@ -71,8 +101,10 @@ static inline void write_pdo(int sl, uint16_t cw, int32_t vel)
 }
 static inline uint16_t read_sw(int sl)
 { uint8 *in = ctx.slavelist[sl].inputs; return in ? *(uint16_t *)(in + 0) : 0; }
-static inline int32_t read_pos63(int sl)
+static inline int32_t read_pos63(int sl)   /* 6063 实际位置(CSV下唯一有效) @offset3 */
 { uint8 *in = ctx.slavelist[sl].inputs; return in ? *(int32_t *)(in + 3) : 0; }
+static inline int32_t read_vel(int sl)     /* 606C 实际速度 @offset7 */
+{ uint8 *in = ctx.slavelist[sl].inputs; return in ? *(int32_t *)(in + 7) : 0; }
 
 static int any_fault(void)
 {
@@ -81,28 +113,377 @@ static int any_fault(void)
    return 0;
 }
 
-static volatile int g_wkc = 0;   /* 上一周期工作计数, 正常应 = 3*从站数附近 */
+/* 心跳灯: LED0=PF9 低电平点亮. 每约500ms翻转一次(4ms节拍 * 125次).
+   只要这个在闪, 就说明 cycle() 在正常跑, 没卡死/没硬件异常复位. */
+static inline void heartbeat(void)
+{
+   static int n = 0;
+   if (++n >= 125) { n = 0; GPIOF->ODR ^= GPIO_PIN_9; }
+}
 
-/* 一个通信周期: 发+收过程数据, 固定节拍 */
+/* 一个通信周期: 发+收过程数据, 固定4ms节拍 */
 static void cycle(void)
 {
    ecx_send_processdata(&ctx);
    g_wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+   heartbeat();
    osal_usleep(CYC_US);
 }
 
-/* CSV 模式 PDO 映射 */
+/* ================= 串口命令解析 ================= */
+/* 累积一行(\r或\n结束)后分派。行首字母=命令, 其余为可选整数参数。 */
+static void handle_cmd(char *line)
+{
+   char c = line[0];
+   int  arg = 0, has = 0;
+   for (char *p = line + 1; *p; p++) {
+      if (*p >= '0' && *p <= '9') { arg = arg * 10 + (*p - '0'); has = 1; }
+   }
+   switch (c) {
+      case '?':
+         uart_log("命令: ? 帮助 | h归零 | g<0-4>运行模式 | x急停 | q下电退出\r\n"
+                  "      a<度>α b<度>β f<厘赫>频率 w<mm>波幅 r<mm>升高 c<次>循环\r\n"
+                  "参数: mode默认由g指定  α=%d° β=%d° 频率=%.2fHz 波幅=%dmm 升高=%dmm 循环=%d\r\n"
+                  "模式: 0波浪 1跖屈背伸 2内翻外翻 3环形 4八字 (5=归零用h)\r\n",
+                  g_aa_deg, g_ba_deg, g_freq_cHz / 100.0, g_wave_mm, g_rise_mm, g_cycles);
+         break;
+      case 'h': g_do_home = 1; break;
+      case 'x': g_abort = 1; break;
+      case 'q': g_quit = 1; break;
+      case 'g':
+         if (has && arg >= 0 && arg <= 4) g_run_request = arg;
+         else uart_log("g 需要 0~4 的模式号\r\n");
+         break;
+      case 'a': if (has) { g_aa_deg = arg; uart_log("α幅度=%d°\r\n", arg); } break;
+      case 'b': if (has) { g_ba_deg = arg; uart_log("β幅度=%d°\r\n", arg); } break;
+      case 'f': if (has) { g_freq_cHz = arg; uart_log("频率=%.2fHz\r\n", arg / 100.0); } break;
+      case 'w': if (has) { g_wave_mm = arg; uart_log("波幅=%dmm\r\n", arg); } break;
+      case 'r': if (has) { g_rise_mm = arg; uart_log("升高=%dmm\r\n", arg); } break;
+      case 'c': if (has) { g_cycles = arg; uart_log("循环=%d\r\n", arg); } break;
+      default: break;   /* 空行/未知命令忽略 */
+   }
+}
+
+/* 把一个字节喂进行缓冲区, 攒够一行(\r或\n)就解析。USART1/USB两路共用同一份逻辑。 */
+static void feed_cmd_byte(char ch)
+{
+   static char buf[32];
+   static int  len = 0;
+   if (ch == '\r' || ch == '\n') {
+      if (len > 0) { buf[len] = '\0'; handle_cmd(buf); len = 0; }
+   } else if (len < (int)sizeof(buf) - 1) {
+      buf[len++] = ch;
+   } else {
+      len = 0;   /* 溢出丢弃 */
+   }
+}
+
+/* 非阻塞轮询串口, USART1(CH340)和USB Slave(虚拟串口)两路都收。每个通信周期调一次。 */
+static void poll_cmd(void)
+{
+   int ch;
+   while ((ch = uart_rx_getc()) >= 0)  feed_cmd_byte((char)ch);
+   while ((ch = usb_cdc_getc()) >= 0)  feed_cmd_byte((char)ch);
+}
+
+/* ================= 前馈 + 位置P闭环 ================= */
+static int32_t limit_out(int sl, double v)
+{
+   if (v >  VMAX) v =  VMAX;
+   if (v < -VMAX) v = -VMAX;
+   double dvmax = AMAX * DT;
+   double dv = v - v_last[sl];
+   if (dv >  dvmax) v = v_last[sl] + dvmax;
+   if (dv < -dvmax) v = v_last[sl] - dvmax;
+   v_last[sl] = v;
+   return (int32_t)v;
+}
+
+/* v_ff: 前馈速度(pulse/s)。返回本帧应下发的速度指令。
+ * 反馈方向未锁前走纯前馈(=开环, 安全), 用上升自然运动锁定极性保证负反馈。 */
+static int32_t vel_closed(int sl, double v_ff)
+{
+   cmd_pos[sl] += v_ff * DT;
+   double raw = (double)(read_pos63(sl) - start_pos[sl]);
+
+   if (fb_sign[sl] == 0) {
+      if (fabs(raw) > SIGN_LOCK_PULSE && fabs(cmd_pos[sl]) > SIGN_LOCK_PULSE) {
+         fb_sign[sl] = ((cmd_pos[sl] > 0) == (raw > 0)) ? 1 : -1;
+         cmd_pos[sl] = fb_sign[sl] * raw;   /* 对齐, 消除接入瞬间突跳 */
+      }
+      return limit_out(sl, v_ff);
+   }
+
+   double actual = fb_sign[sl] * raw;
+   double err = cmd_pos[sl] - actual;
+   double e = (err < DEADBAND && err > -DEADBAND) ? 0.0 : err;
+   double corr_raw = KP_POS * e;
+   double alpha = (LPF_TAU > 0.0) ? DT / (LPF_TAU + DT) : 1.0;
+   corr_filt[sl] += alpha * (corr_raw - corr_filt[sl]);
+   return limit_out(sl, v_ff + corr_filt[sl]);
+}
+
+/* ================= 3-RPS 正向运动学 ================= */
+/* R_base=200 r_mov=140 120°均布; alpha内翻外翻(绕X), beta跖屈背伸(绕Y) */
+static void fk_3rps(double alpha, double beta, double z_eff, double l_out[3])
+{
+   static const double A[3][2] = {
+      { 200.0,   0.0        },
+      {-100.0,  173.2050808 },
+      {-100.0, -173.2050808 }
+   };
+   static const double B[3][2] = {
+      { 140.0,   0.0        },
+      { -70.0,  121.2435565 },
+      { -70.0, -121.2435565 }
+   };
+   double ca = cos(alpha), sa = sin(alpha), cb = cos(beta), sb = sin(beta);
+   double R[3][3] = {
+      { cb,   sa * sb,  ca * sb },
+      { 0.0,  ca,      -sa      },
+      {-sb,   sa * cb,  ca * cb }
+   };
+   for (int i = 0; i < 3; i++) {
+      double bx = R[0][0] * B[i][0] + R[0][1] * B[i][1];
+      double by = R[1][0] * B[i][0] + R[1][1] * B[i][1];
+      double bz = z_eff + R[2][0] * B[i][0] + R[2][1] * B[i][1];
+      double dx = bx - A[i][0];
+      double dy = by - A[i][1];
+      l_out[i] = sqrt(dx * dx + dy * dy + bz * bz);
+   }
+}
+
+/* 角度轨迹: 按模式返回当前相位 t 的 alpha,beta(弧度) */
+static void get_angles(int mode, double t, double aa_r, double ba_r,
+                       double *alpha, double *beta)
+{
+   switch (mode) {
+      case 1: *alpha = 0;             *beta = ba_r * sin(t);         break;  /* 跖屈/背伸 */
+      case 2: *alpha = aa_r * sin(t); *beta = 0;                     break;  /* 内翻/外翻 */
+      case 3: *alpha = aa_r * sin(t); *beta = ba_r * cos(t);         break;  /* 环形 */
+      case 4: *alpha = aa_r * sin(t); *beta = ba_r * sin(2.0 * t);   break;  /* 8字 */
+      default:*alpha = 0;             *beta = 0;                     break;
+   }
+}
+
+/* ================= 运动阶段公共件 ================= */
+/* 运动前初始化闭环零点(以当前位置为起点) */
+static void motion_reset(void)
+{
+   for (int sl = 1; sl <= ctx.slavecount; sl++) {
+      start_pos[sl] = read_pos63(sl);
+      cmd_pos[sl]   = 0.0;
+      v_last[sl]    = 0.0;
+      corr_filt[sl] = 0.0;
+      fb_sign[sl]   = 0;
+   }
+}
+
+/* 急停/报警时平滑降速回0(闭环, 保持使能)。返回后回待机。 */
+static void ramp_to_zero(void)
+{
+   for (int i = 0; i < RAMP_FRAMES; i++) {
+      for (int sl = 1; sl <= ctx.slavecount; sl++)
+         write_pdo(sl, 0x000F, vel_closed(sl, 0.0));
+      cycle();
+   }
+   for (int i = 0; i < 50; i++) {
+      for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0);
+      cycle();
+   }
+}
+
+/* 三轴同步做一段"前馈速度=vff(每轴相同)"的运动. 返回: 0正常 -1报警 -2急停 */
+/* raise_vel: 匀速目标(pulse/s, 正=上升 负=下降); 内部自动加/匀/减速三段 */
+static int move_ramp(double raise_vel, int cruise_frames)
+{
+   int i;
+   /* 加速 */
+   for (i = 0; i < RAMP_FRAMES; i++) {
+      double vff = raise_vel * i / RAMP_FRAMES;
+      for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, vff));
+      cycle(); poll_cmd();
+      if (any_fault()) { g_ec_fault = any_fault(); return -1; }
+      if (g_abort) return -2;
+   }
+   /* 匀速 */
+   for (i = 0; i < cruise_frames; i++) {
+      for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, raise_vel));
+      cycle(); poll_cmd();
+      if (any_fault()) { g_ec_fault = any_fault(); return -1; }
+      if (g_abort) return -2;
+   }
+   /* 减速 */
+   for (i = 0; i < RAMP_FRAMES; i++) {
+      double vff = raise_vel * (RAMP_FRAMES - i) / RAMP_FRAMES;
+      for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, vff));
+      cycle(); poll_cmd();
+      if (any_fault()) { g_ec_fault = any_fault(); return -1; }
+      if (g_abort) return -2;
+   }
+   return 0;
+}
+
+/* ================= 康复模式 (上升→运动→下降) ================= */
+static int run_rehab_mode(int mode)
+{
+   int i, sl, rc;
+   g_abort = 0;
+   g_ec_fault = 0;
+   motion_reset();
+
+   int32_t raise_vel  = (int32_t)((double)g_rise_rpm / 60.0 * PULSE_PER_REV);
+   int32_t rise_pulse = (int32_t)((double)g_rise_mm * PULSE_PER_REV / LEAD_MM);
+   int cruise_frames  = (int)((double)rise_pulse / ((double)raise_vel * DT));
+   if (cruise_frames < 1) cruise_frames = 1;
+
+   uart_log(">>> 模式%d 开始: 上升%dmm@%dRPM → 运动 → 下降 <<<\r\n", mode, g_rise_mm, g_rise_rpm);
+
+   /* 阶段1: 上升 */
+   rc = move_ramp((double)raise_vel, cruise_frames);
+   if (rc < 0) goto stopmsg;
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); }
+   uart_log("  上升完成, 方向锁定: 轴1=%+d 轴2=%+d 轴3=%+d\r\n", fb_sign[1], fb_sign[2], fb_sign[3]);
+
+   /* 阶段2: 运动 */
+   if (mode == 0) {
+      /* 综合波浪(电缸空间三轴相位差) */
+      int32_t wave_amp = (int32_t)((double)g_wave_mm * PULSE_PER_REV / LEAD_MM);
+      int wave_period = (int)((double)wave_amp * 2.0 * M_PI / (WAVE_PEAK_RPM / 60.0 * PULSE_PER_REV) / DT);
+      if (wave_period < 100) wave_period = 100;
+      double wave_v_amp = (double)wave_amp * 2.0 * M_PI / wave_period / DT;
+      int total = g_cycles * wave_period;
+      uart_log("  阶段2 综合波浪: 幅%dmm 周期%.1fs × %d\r\n", g_wave_mm, wave_period * DT, g_cycles);
+      for (i = 0; i < total; i++) {
+         double t = 2.0 * M_PI * i / wave_period;
+         for (sl = 1; sl <= ctx.slavecount; sl++) {
+            double vff = wave_v_amp * cos(t + PHASE[sl]);
+            write_pdo(sl, 0x000F, vel_closed(sl, vff));
+         }
+         cycle(); poll_cmd();
+         if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
+         if (g_abort) { rc = -2; goto stopmsg; }
+         if (i % 500 == 0)
+            uart_log("  [%ds] 轴1=%.1fmm 轴2=%.1fmm 轴3=%.1fmm\r\n", (int)(i * DT),
+                     (read_pos63(1) - start_pos[1]) * MM_PER_PULSE,
+                     (read_pos63(2) - start_pos[2]) * MM_PER_PULSE,
+                     (read_pos63(3) - start_pos[3]) * MM_PER_PULSE);
+      }
+   } else {
+      /* FK 角度空间(1跖背 2内外 3环形 4八字) */
+      double aa_r = g_aa_deg * M_PI / 180.0;
+      double ba_r = g_ba_deg * M_PI / 180.0;
+      if (aa_r > M_PI / 6) aa_r = M_PI / 6;    /* 限幅±30° */
+      if (ba_r > M_PI / 6) ba_r = M_PI / 6;
+      double freq = g_freq_cHz / 100.0;
+      if (freq < 0.05) freq = 0.05;
+      if (freq > 0.8)  freq = 0.8;
+      double z_eff = FK_Z0 + (double)g_rise_mm;
+      int period_frames = (int)(1.0 / (freq * DT));
+      if (period_frames < 50) period_frames = 50;
+      int total = g_cycles * period_frames;
+      double omega = 2.0 * M_PI * freq;
+      uart_log("  阶段2 FK模式%d: α%d° β%d° %.2fHz 周期%.1fs × %d\r\n",
+               mode, g_aa_deg, g_ba_deg, freq, period_frames * DT, g_cycles);
+      for (i = 0; i < total; i++) {
+         double t0 = omega * i * DT, t1 = omega * (i + 1) * DT;
+         double a0, b0, a1, b1, lc[3], ln[3];
+         get_angles(mode, t0, aa_r, ba_r, &a0, &b0);
+         get_angles(mode, t1, aa_r, ba_r, &a1, &b1);
+         fk_3rps(a0, b0, z_eff, lc);
+         fk_3rps(a1, b1, z_eff, ln);
+         for (sl = 1; sl <= ctx.slavecount; sl++) {
+            double v_mms = (ln[sl - 1] - lc[sl - 1]) / DT;   /* mm/s */
+            double vff = v_mms / MM_PER_PULSE;               /* pulse/s */
+            write_pdo(sl, 0x000F, vel_closed(sl, vff));
+         }
+         cycle(); poll_cmd();
+         if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
+         if (g_abort) { rc = -2; goto stopmsg; }
+         if (i % 500 == 0) {
+            double a_now, b_now;
+            get_angles(mode, t0, aa_r, ba_r, &a_now, &b_now);
+            uart_log("  [%ds] α=%.1f° β=%.1f°\r\n", (int)(i * DT),
+                     a_now * 180.0 / M_PI, b_now * 180.0 / M_PI);
+         }
+      }
+   }
+
+   /* 阶段3: 下降回原点 */
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); }
+   rc = move_ramp(-(double)raise_vel, cruise_frames);
+   if (rc < 0) goto stopmsg;
+   /* 末端主动闭环回精确原点 */
+   for (i = 0; i < 150; i++) {
+      for (sl = 1; sl <= ctx.slavecount; sl++) { cmd_pos[sl] = 0.0; write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); }
+      cycle(); poll_cmd();
+      if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
+      if (g_abort) { rc = -2; goto stopmsg; }
+   }
+
+   uart_log(">>> 模式%d 完成, 残余误差: 轴1=%.2fmm 轴2=%.2fmm 轴3=%.2fmm <<<\r\n", mode,
+            (read_pos63(1) - start_pos[1]) * MM_PER_PULSE,
+            (read_pos63(2) - start_pos[2]) * MM_PER_PULSE,
+            (read_pos63(3) - start_pos[3]) * MM_PER_PULSE);
+   return 0;
+
+stopmsg:
+   if (rc == -2) uart_log("!! 急停, 平滑降速回待机\r\n");
+   else          uart_log("!! 从站%d 报警, 平滑降速回待机\r\n", g_ec_fault);
+   ramp_to_zero();
+   return rc;
+}
+
+/* ================= 归零(堵转检测收回) ================= */
+static void run_homing(void)
+{
+   int i, sl;
+   int stall_cnt[EC_MAXSLAVE] = {0}, stopped[EC_MAXSLAVE] = {0};
+   int32_t vel_cmd[EC_MAXSLAVE];
+   g_abort = 0; g_ec_fault = 0;
+
+   uart_log(">>> 归零: 三轴收缩@%dpulse/s, 堵转自停 <<<\r\n", RETRACT_VEL);
+   for (sl = 1; sl <= ctx.slavecount; sl++) vel_cmd[sl] = RETRACT_VEL;
+
+   /* 缓慢加速到收缩速度 */
+   for (i = 0; i < 100; i++) {
+      int32_t v = (int32_t)((int64_t)RETRACT_VEL * i / 100);
+      for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, v);
+      cycle(); poll_cmd();
+      if (g_abort) { ramp_to_zero(); uart_log("!! 归零急停\r\n"); return; }
+   }
+
+   for (i = 0; i < HOME_MAX_FRAMES; i++) {
+      for (sl = 1; sl <= ctx.slavecount; sl++) {
+         if (stopped[sl]) continue;
+         int32_t av = read_vel(sl); if (av < 0) av = -av;
+         if (av < STALL_THR) {
+            if (++stall_cnt[sl] >= STALL_FRAMES) {
+               stopped[sl] = 1; vel_cmd[sl] = 0;
+               uart_log("  ★ 轴%d 到限位, 位置=%ld\r\n", sl, (long)read_pos63(sl));
+            }
+         } else stall_cnt[sl] = 0;
+      }
+      for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_cmd[sl]);
+      cycle(); poll_cmd();
+      if (g_abort) { ramp_to_zero(); uart_log("!! 归零急停\r\n"); return; }
+
+      int all = 1;
+      for (sl = 1; sl <= ctx.slavecount; sl++) if (!stopped[sl]) all = 0;
+      if (all) { uart_log(">>> 归零完成, 所有轴到位 <<<\r\n"); return; }
+   }
+   uart_log(">>> 归零超时(部分轴未检测到限位) <<<\r\n");
+   ramp_to_zero();
+}
+
+/* ================= EtherCAT 启动(扫描→PDO→OP→使能) ================= */
 static int setup_pdo_csv(int slave)
 {
    uint8 u8; uint16 u16; uint32 u32; int wkc;
 
-   /* --- RxPDO 0x1600: CW(6040) + Mode(6060) + TargetVel(60FF) --- */
    u8 = 0;
    wkc = ecx_SDOwrite(&ctx, slave, 0x1C12, 0x00, FALSE, 1, &u8, EC_TIMEOUTRXM);
-   if (wkc <= 0) {
-      uart_log("    [错误] 从站%d 首次SDO写(1C12)失败 wkc=%d, 邮箱/PRE-OP可能没建立\r\n", slave, wkc);
-      return -1;
-   }
+   if (wkc <= 0) { uart_log("  [错误] 从站%d SDO写(1C12)失败\r\n", slave); return -1; }
    u8 = 0; ecx_SDOwrite(&ctx, slave, 0x1600, 0x00, FALSE, 1, &u8, EC_TIMEOUTRXM);
    u32 = 0x60400010; ecx_SDOwrite(&ctx, slave, 0x1600, 0x01, FALSE, 4, &u32, EC_TIMEOUTRXM);
    u32 = 0x60600008; ecx_SDOwrite(&ctx, slave, 0x1600, 0x02, FALSE, 4, &u32, EC_TIMEOUTRXM);
@@ -111,7 +492,6 @@ static int setup_pdo_csv(int slave)
    u16 = 0x1600; ecx_SDOwrite(&ctx, slave, 0x1C12, 0x01, FALSE, 2, &u16, EC_TIMEOUTRXM);
    u8 = 1;       ecx_SDOwrite(&ctx, slave, 0x1C12, 0x00, FALSE, 1, &u8,  EC_TIMEOUTRXM);
 
-   /* --- TxPDO 0x1A00: SW(6041) + Mode(6061) + Pos(6063) + Vel(606C) --- */
    u8 = 0; ecx_SDOwrite(&ctx, slave, 0x1C13, 0x00, FALSE, 1, &u8, EC_TIMEOUTRXM);
    u8 = 0; ecx_SDOwrite(&ctx, slave, 0x1A00, 0x00, FALSE, 1, &u8, EC_TIMEOUTRXM);
    u32 = 0x60410010; ecx_SDOwrite(&ctx, slave, 0x1A00, 0x01, FALSE, 4, &u32, EC_TIMEOUTRXM);
@@ -124,206 +504,71 @@ static int setup_pdo_csv(int slave)
    return 0;
 }
 
-#if !PROBE_MAX_STROKE
-/* 让三轴一起走到相对起点 +target_pulse 的位置(CSV速度环), 到位或超时返回 */
-static void move_to(int32_t target_pulse)
+/* 平滑下电: 脱力 → 退OP→SAFE-OP→INIT, 关看门狗, 之后可安全断电/拔网线 */
+static void graceful_shutdown(void)
 {
-   int i;
-   for (i = 0; i < MAX_CYC_PHASE; i++)
-   {
-      int done = 1;
-      for (int sl = 1; sl <= ctx.slavecount; sl++)
-      {
-         int32_t actual = read_pos63(sl) - start_pos[sl];
-         int32_t err = target_pulse - actual;
-         int32_t vel = (int32_t)KP * err;
-         if (vel >  VMAX) vel =  VMAX;
-         if (vel < -VMAX) vel = -VMAX;
-         if (err < DEADBAND && err > -DEADBAND) vel = 0;
-         else done = 0;
-         write_pdo(sl, 0x000F, vel);
-      }
-      cycle();
-      if (any_fault()) { g_ec_fault = any_fault(); return; }
-      if (done) return;
-   }
-   uart_log("    [超时] %d个周期未到位, 从站1目标=%ld 实际=%ld\r\n",
-            MAX_CYC_PHASE, (long)target_pulse, (long)(read_pos63(1) - start_pos[1]));
+   int i, sl;
+   uart_log("下电: 脱力...\r\n");
+   for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); }
+   ctx.slavelist[0].state = EC_STATE_SAFE_OP;
+   ecx_writestate(&ctx, 0);
+   ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
+   ctx.slavelist[0].state = EC_STATE_INIT;
+   ecx_writestate(&ctx, 0);
+   ecx_statecheck(&ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE * 4);
+   ecx_close(&ctx);
+   uart_log(">>> 已退到 INIT, 可安全断电/拔网线 <<<\r\n");
 }
-#endif
-
-#if PROBE_MAX_STROKE
-/* 慢速推到各轴自己的机械极限(失速判定), 记录每轴最大行程, 再慢速退回零位 */
-static void probe_max_stroke(void)
-{
-   int32_t win_start_pos[EC_MAXSLAVE] = {0};
-   int32_t max_pulse[EC_MAXSLAVE] = {0};
-   int stalled[EC_MAXSLAVE] = {0};
-   int win_cnt = 0;
-   int cyc;
-
-   uart_log(">>> 开始探测三轴最大行程 (0~%.0fmm已验证段用%.2fmm/s快速通过, "
-            "之后未知段降到%.2fmm/s, 软件硬顶=%.0fmm) <<<\r\n",
-            PROBE_FAST_MM, (double)PROBE_VMAX_FAST * LEAD_MM / PULSE_PER_REV,
-            (double)PROBE_VMAX_SLOW * LEAD_MM / PULSE_PER_REV, ABS_MAX_MM);
-
-   for (int sl = 1; sl <= ctx.slavecount; sl++) win_start_pos[sl] = read_pos63(sl) - start_pos[sl];
-
-   for (cyc = 0; cyc < PROBE_TIMEOUT_CYC; cyc++)
-   {
-      int all_stalled = 1;
-      for (int sl = 1; sl <= ctx.slavecount; sl++)
-      {
-         int32_t cur = read_pos63(sl) - start_pos[sl];
-         if (!stalled[sl])
-         {
-            all_stalled = 0;
-            if (cur >= ABS_MAX_PULSE) {
-               stalled[sl] = 1;
-               max_pulse[sl] = cur;
-               uart_log("    从站%d 到达软件硬顶 %.0fmm, 停止该轴\r\n", sl, ABS_MAX_MM);
-            } else {
-               int32_t v = (cur < PROBE_FAST_PULSE) ? PROBE_VMAX_FAST : PROBE_VMAX_SLOW;
-               write_pdo(sl, 0x000F, v);
-            }
-         }
-         if (stalled[sl]) write_pdo(sl, 0x000F, 0);
-      }
-      cycle();
-      if (any_fault()) {
-         g_ec_fault = any_fault();
-         uart_log("[中止] 探测中从站%d 报警, 停止探测\r\n", g_ec_fault);
-         break;
-      }
-
-      if (++win_cnt >= STALL_WINDOW_CYC)
-      {
-         for (int sl = 1; sl <= ctx.slavecount; sl++)
-         {
-            if (!stalled[sl])
-            {
-               int32_t cur = read_pos63(sl) - start_pos[sl];
-               if ((cur - win_start_pos[sl]) < STALL_EPS_PULSE)
-               {
-                  stalled[sl] = 1;
-                  max_pulse[sl] = cur;
-                  uart_log("    从站%d 失速, 判定最大行程=%.2fmm\r\n",
-                           sl, (double)cur * LEAD_MM / PULSE_PER_REV);
-               }
-               win_start_pos[sl] = cur;
-            }
-         }
-         uart_log("    [进度] 从站1=%.1fmm 从站2=%.1fmm 从站3=%.1fmm\r\n",
-                  (double)(read_pos63(1) - start_pos[1]) * LEAD_MM / PULSE_PER_REV,
-                  (double)(read_pos63(2) - start_pos[2]) * LEAD_MM / PULSE_PER_REV,
-                  (double)(read_pos63(3) - start_pos[3]) * LEAD_MM / PULSE_PER_REV);
-         win_cnt = 0;
-      }
-
-      if (all_stalled || g_ec_fault) break;
-   }
-
-   /* 兜底: 超时结束但还有轴没标记停止, 按当前位置收尾 */
-   for (int sl = 1; sl <= ctx.slavecount; sl++)
-      if (!stalled[sl]) max_pulse[sl] = read_pos63(sl) - start_pos[sl];
-
-   {
-      double avg = 0;
-      for (int sl = 1; sl <= ctx.slavecount; sl++) {
-         double mm = (double)max_pulse[sl] * LEAD_MM / PULSE_PER_REV;
-         avg += mm;
-         uart_log("    从站%d 最大行程 = %.2f mm\r\n", sl, mm);
-      }
-      avg /= ctx.slavecount;
-      uart_log(">>> 三轴平均最大行程 = %.2f mm <<<\r\n", avg);
-   }
-
-   if (!g_ec_fault)
-   {
-      uart_log("退回零位...\r\n");
-      for (cyc = 0; cyc < PROBE_TIMEOUT_CYC; cyc++)
-      {
-         int done = 1;
-         for (int sl = 1; sl <= ctx.slavecount; sl++)
-         {
-            int32_t cur = read_pos63(sl) - start_pos[sl];
-            /* 退回是往已经走过的空段退, 没有撞障碍风险, 全程用正常速度快退 */
-            if (cur > DEADBAND) { write_pdo(sl, 0x000F, -PROBE_VMAX_FAST); done = 0; }
-            else                { write_pdo(sl, 0x000F, 0); }
-         }
-         cycle();
-         if (any_fault()) { g_ec_fault = any_fault(); break; }
-         if (done) break;
-      }
-      uart_log(g_ec_fault ? "退回零位中断(报警)\r\n" : "已退回零位\r\n");
-   }
-}
-#endif
 
 void ecat_motion_run(void)
 {
    int sl, i;
 
    uart_log_init();
-   uart_log("\r\n\r\n===== STM32 SOEM 启动 =====\r\n");
+   uart_log("\r\n\r\n===== STM32 SOEM 康复运动 (CSV, 命令驱动) =====\r\n");
+
+   uart_log("上次复位原因:");
+   if (g_reset_cause & RCC_CSR_PORRSTF)  uart_log(" 上电复位(POR/PDR)");
+   if (g_reset_cause & RCC_CSR_PADRSTF)  uart_log(" 外部NRST引脚复位(硬件拉低, 疑似DTR)");
+   if (g_reset_cause & RCC_CSR_SFTRSTF)  uart_log(" 软件复位");
+   if (g_reset_cause & RCC_CSR_IWDGRSTF) uart_log(" 独立看门狗复位");
+   if (g_reset_cause & RCC_CSR_WWDGRSTF) uart_log(" 窗口看门狗复位");
+   if (g_reset_cause & RCC_CSR_LPWRRSTF) uart_log(" 低功耗复位");
+   uart_log("  (CSR=0x%08lX)\r\n", (unsigned long)g_reset_cause);
 
    g_ec_phase = 1;
-   /* ifname 参数在 STM32 移植里被忽略, 传占位字符串即可 */
    if (!ecx_init(&ctx, "stm32eth")) {
-      uart_log("[错误] 网卡初始化失败 (ecx_init)\r\n");
-      g_ec_phase = -1; return;
+      uart_log("[错误] 网卡初始化失败\r\n"); g_ec_phase = -1; return;
    }
-   uart_log("网卡就绪, 开始扫描总线...\r\n");
+   uart_log("网卡就绪, 扫描总线...\r\n");
 
    g_ec_phase = 2;
    if (ecx_config_init(&ctx) <= 0) {
-      uart_log("[错误] 没扫到从站! 检查网线/伺服上电\r\n");
-      g_ec_phase = -2; ecx_close(&ctx); return;
+      uart_log("[错误] 没扫到从站! 检查网线/伺服上电\r\n"); g_ec_phase = -2; ecx_close(&ctx); return;
    }
-   g_ec_slavecount = ctx.slavecount;      /* ===== 里程碑A: 这里应为 3 ===== */
-   uart_log(">>> 里程碑A: 扫到 %d 个从站 <<<\r\n", ctx.slavecount);
-   for (sl = 1; sl <= ctx.slavecount; sl++)
-      uart_log("    从站%d: %s\r\n", sl, ctx.slavelist[sl].name);
+   g_ec_slavecount = ctx.slavecount;
+   uart_log(">>> 扫到 %d 个从站 <<<\r\n", ctx.slavecount);
+   for (sl = 1; sl <= ctx.slavecount; sl++) uart_log("    从站%d: %s\r\n", sl, ctx.slavelist[sl].name);
    if (ctx.slavecount < 1) { g_ec_phase = -2; ecx_close(&ctx); return; }
 
    /* PRE-OP: 配 CSV 的 PDO */
    g_ec_phase = 3;
    ctx.slavelist[0].state = EC_STATE_PRE_OP;
    ecx_writestate(&ctx, 0);
-   {
-      int st = ecx_statecheck(&ctx, 0, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
-      uart_log("PRE-OP 切换结果: 实际状态=0x%02X (期望0x%02X)\r\n", st, EC_STATE_PRE_OP);
-   }
-   /* ecx_statecheck(ctx,0,...)是广播检查,只更新slavelist[0].state,
-      不会更新各从站自己的.state(仍停在config_init时的INIT)。
-      ecx_mbxsend内部要靠slavelist[slave].state>=PRE_OP才会真正发SDO邮箱写,
-      必须在这里用ecx_readstate同步一次各从站的本地状态缓存,否则SDO写会静默返回wkc=0。 */
-   ecx_readstate(&ctx);
-   for (sl = 1; sl <= ctx.slavecount; sl++) {
-      uart_log("  配置从站%d PDO...\r\n", sl);
-      if (setup_pdo_csv(sl) < 0) {
-         g_ec_phase = -3;
-         uart_log("[错误] 从站%d PDO配置失败, 停止 (phase=-3)\r\n", sl);
-         ecx_close(&ctx);
-         return;
-      }
-   }
-   uart_log("所有从站PDO配置完成, 建立IOmap...\r\n");
+   ecx_statecheck(&ctx, 0, EC_STATE_PRE_OP, EC_TIMEOUTSTATE);
+   ecx_readstate(&ctx);   /* 同步各从站本地状态, 否则SDO写静默失败 */
+   for (sl = 1; sl <= ctx.slavecount; sl++)
+      if (setup_pdo_csv(sl) < 0) { g_ec_phase = -3; ecx_close(&ctx); return; }
 
    ecx_config_map_group(&ctx, IOmap, 0);
 
-   /* SAFE-OP → 先发几帧 → OP */
+   /* SAFE-OP → OP */
    g_ec_phase = 4;
-   uart_log("PDO映射完成, 进 SAFE-OP...\r\n");
    ctx.slavelist[0].state = EC_STATE_SAFE_OP;
    ecx_writestate(&ctx, 0);
-   {
-      int st = ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
-      uart_log("SAFE-OP 切换结果: 实际状态=0x%02X (期望0x%02X)\r\n", st, EC_STATE_SAFE_OP);
-   }
+   ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
    for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0000, 0); cycle(); }
 
-   uart_log("进 OP...\r\n");
    ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
    ecx_writestate(&ctx, 0);
    for (i = 0; i < 200; i++) {
@@ -331,81 +576,31 @@ void ecat_motion_run(void)
       if (i % 40 == 0) ecx_writestate(&ctx, 0);
       cycle();
    }
-   {
-      int st = ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
-      uart_log("OP 切换结果: 实际状态=0x%02X (期望0x%02X)\r\n", st, EC_STATE_OPERATIONAL);
-   }
+   ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
    uart_log("OP 建立, WKC=%d (正常≈%d)\r\n", g_wkc, ctx.slavecount * 3);
-
-   /* 使能前倒计时: 留时间让人离开机构, 期间保持零指令、正常周期通讯 */
-   uart_log("使能伺服前倒计时 %d 秒, 请远离机构...\r\n", START_DELAY_S);
-   for (int s = START_DELAY_S; s > 0; s--) {
-      uart_log("  %d...\r\n", s);
-      for (int k = 0; k < (1000000 / CYC_US); k++) {
-         for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0000, 0);
-         cycle();
-      }
-   }
 
    /* CiA402 使能: 0x06 → 0x07 → 0x0F */
    g_ec_phase = 5;
-   uart_log("使能伺服 (0x06→0x07→0x0F)...\r\n");
    for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); }
    for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0007, 0); cycle(); }
    for (i = 0; i < 300; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0); cycle(); }
-
    for (sl = 1; sl <= ctx.slavecount; sl++)
       uart_log("    从站%d 状态字=0x%04X %s\r\n", sl, read_sw(sl),
                (read_sw(sl) & 0x0008) ? "[报警!]" : (((read_sw(sl) & 0x006F) == 0x0027) ? "[已使能]" : ""));
-   if (any_fault()) {
-      g_ec_fault = any_fault(); g_ec_phase = -5;
-      uart_log("[错误] 使能后从站%d 报警, 停止\r\n", g_ec_fault);
-   }
 
-   /* 记录使能后的位置作为零点 */
-   for (sl = 1; sl <= ctx.slavecount; sl++) start_pos[sl] = read_pos63(sl);
-
-#if PROBE_MAX_STROKE
-   g_ec_phase = 10;
-   probe_max_stroke();
-#else
-   /* ===== 里程碑B: 伸出/缩回 × 5 ===== */
-   uart_log(">>> 里程碑B: 开始伸缩 %d 次 (每次 %d mm) <<<\r\n", CYCLES, (int)ROD_MM);
-   for (int c = 0; c < CYCLES && !g_ec_fault; c++)
-   {
-      g_ec_phase = 10 + c;
-      uart_log("  第%d次: 伸出...\r\n", c + 1);
-      move_to(ROD_PULSE);   /* 伸出 */
-      for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0); cycle(); }
-      uart_log("  第%d次: 缩回...\r\n", c + 1);
-      move_to(0);           /* 缩回 */
-      for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0); cycle(); }
-   }
-#endif
-
-   if (g_ec_fault) uart_log("[结束] 运动中从站%d 报警\r\n", g_ec_fault);
-   else            uart_log(">>> 完成! 准备下电 <<<\r\n");
-
-   /* 结束: CiA402 Shutdown(CW=0x06)脱力, 不再输出转矩/保持位置 */
+   /* ===== 待机: 听命令 ===== */
    g_ec_phase = 99;
-   for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); }
-   for (sl = 1; sl <= ctx.slavecount; sl++)
-      uart_log("    从站%d 已下电, 状态字=0x%04X\r\n", sl, read_sw(sl));
+   uart_log("\r\n>>> 进入待机, 伺服使能保持零速. 发 ? 查看命令. 建议先 h 归零 <<<\r\n");
+   while (!g_quit) {
+      for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0);
+      cycle();
+      poll_cmd();
 
-   /* 退到 SAFE-OP 再退到 INIT: 过程数据看门狗(SM2/3 watchdog)只在SAFE-OP/OP下生效,
-      退回INIT后从站不再监视周期帧, 之后拔网线不会触发从站看门狗报警。
-      逐级退(OP→SAFE-OP→INIT)是标准做法, 比直接跳INIT更稳妥。 */
-   uart_log("退出OP, 关闭过程数据看门狗监视...\r\n");
-   ctx.slavelist[0].state = EC_STATE_SAFE_OP;
-   ecx_writestate(&ctx, 0);
-   ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
-   ctx.slavelist[0].state = EC_STATE_INIT;
-   ecx_writestate(&ctx, 0);
-   {
-      int st = ecx_statecheck(&ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE * 4);
-      uart_log(">>> 已退到 INIT (0x%02X), 不再需要周期通讯, 现在可以安全拔网线 <<<\r\n", st);
+      if (g_do_home)          { g_do_home = 0; g_run_request = -1; run_homing(); uart_log(">>> 回待机 <<<\r\n"); }
+      else if (g_run_request >= 0) { int m = g_run_request; g_run_request = -1; g_do_home = 0; run_rehab_mode(m); uart_log(">>> 回待机 <<<\r\n"); }
    }
-   ecx_close(&ctx);
 
-   while (1) { osal_usleep(100000); }   /* 彻底空转, 不再收发任何EtherCAT帧 */
+   /* 收到 q: 平滑下电退出 */
+   graceful_shutdown();
+   while (1) { osal_usleep(100000); }
 }

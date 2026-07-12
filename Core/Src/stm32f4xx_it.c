@@ -22,6 +22,8 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "stm32f4xx_hal_pcd.h"
+extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -200,5 +202,13 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief This function handles USB OTG FS global interrupt (USB Slave/Micro-USB).
+  */
+void OTG_FS_IRQHandler(void)
+{
+   HAL_PCD_IRQHandler(&hpcd_USB_OTG_FS);
+}
 
 /* USER CODE END 1 */

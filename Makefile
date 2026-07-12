@@ -57,12 +57,23 @@ Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_cortex.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_exti.c \
 Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_eth.c \
+Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pcd.c \
+Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_pcd_ex.c \
+Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_ll_usb.c \
+Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_core.c \
+Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ctlreq.c \
+Middlewares/ST/STM32_USB_Device_Library/Core/Src/usbd_ioreq.c \
+Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c \
 SOEM_Port/osal.c \
 SOEM_Port/nicdrv.c \
 SOEM_Port/oshw.c \
 SOEM_Port/stm32_eth.c \
 App/ecat_motion.c \
 App/uart_log.c \
+App/usb_device.c \
+App/usbd_conf.c \
+App/usbd_desc.c \
+App/usbd_cdc_if.c \
 $(SOEM_DIR)/src/ec_base.c \
 $(SOEM_DIR)/src/ec_coe.c \
 $(SOEM_DIR)/src/ec_config.c \
@@ -143,7 +154,9 @@ C_INCLUDES =  \
 -IDrivers/STM32F4xx_HAL_Driver/Inc/Legacy \
 -IDrivers/BSP/Components/lan8742 \
 -IDrivers/CMSIS/Device/ST/STM32F4xx/Include \
--IDrivers/CMSIS/Include
+-IDrivers/CMSIS/Include \
+-IMiddlewares/ST/STM32_USB_Device_Library/Core/Inc \
+-IMiddlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
 
 
 # compile gcc flags

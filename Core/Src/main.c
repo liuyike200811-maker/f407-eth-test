@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "ecat_motion.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -67,6 +68,12 @@ int main(void)
 
   /* USER CODE BEGIN 1 */
 
+  /* 复位原因诊断: 必须在HAL_Init()之前读, 读完立刻清掉标志位方便看下一次的.
+     RCC->CSR 的 PINRSTF 位如果被置位, 就实锤是外部 NRST 引脚被拉低复位的
+     (对应"一开串口板子就断"的怀疑: CH340 DTR/RTS 通过板子P4排针接到了 RESET)。 */
+  g_reset_cause = RCC->CSR;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -97,11 +104,29 @@ int main(void)
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);   /* 拉高: 松开复位 */
     HAL_Delay(100);                                       /* 等 PHY 内部就绪 */
   }
+
+  /* --- 心跳灯诊断: LED0=PF9, 低电平点亮(战神板寄存器例程实测).
+         开机立即闪一下, 证明代码执行到这里(时钟+GPIO正常);
+         后续心跳由 ecat_motion.c 在EtherCAT循环里接管闪烁,
+         如果这一下都没闪说明卡在SystemClock_Config/HAL_Init之前(比如HSE不起振)。--- */
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+  {
+    GPIO_InitTypeDef led = {0};
+    led.Pin   = GPIO_PIN_9;
+    led.Mode  = GPIO_MODE_OUTPUT_PP;
+    led.Pull  = GPIO_NOPULL;
+    led.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOF, &led);
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_RESET);  /* 点亮 */
+    HAL_Delay(200);
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_SET);    /* 熄灭 */
+  }
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
+  MX_USB_DEVICE_Init();   /* USB Slave(Micro-USB, PA11/PA12) 枚举成CDC虚拟串口 */
   ecat_motion_run();   /* 扫从站 → CSV使能 → 伸出/缩回×5, 内部死循环, 不返回 */
   /* USER CODE END 2 */
 
@@ -112,7 +137,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* ecat_motion_run() 内部已死循环, 这里不会执行到 */
+    /* 正常情况下 ecat_motion_run() 内部死循环, 不会执行到这里;
+       一旦跑到这, 说明它提前 return 了(比如没扫到从站/网卡初始化失败),
+       用快闪(100ms)跟正常心跳区分, 方便直接用灯判断"提前退出"这种情况 */
+    HAL_GPIO_TogglePin(GPIOF, GPIO_PIN_9);
+    HAL_Delay(100);
   }
   /* USER CODE END 3 */
 }
@@ -141,7 +170,10 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 4;
   RCC_OscInitStruct.PLL.PLLN = 168;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  /* PLLQ=7: VCO(336MHz)/7=48MHz, USB OTG FS要求这里必须精确等于48MHz才能工作;
+     原来的4会得到84MHz, USB完全不能用。PLLQ不影响SYSCLK(由PLLP决定), 改这里
+     对EtherCAT的168MHz主频没有任何影响。 */
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();

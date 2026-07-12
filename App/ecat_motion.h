@@ -13,6 +13,9 @@ extern volatile int g_ec_slavecount;  /* 扫到的从站数 (里程碑A: 应为3
 extern volatile int g_ec_phase;       /* 当前阶段编号 */
 extern volatile int g_ec_fault;       /* !=0 表示某从站报警 */
 
+/* 上一次复位原因(RCC->CSR原始值), main()里HAL_Init前保存, 进ecat_motion_run打印后即可丢弃 */
+extern volatile unsigned int g_reset_cause;
+
 /* 上电后调用一次, 内部自带完整流程, 不返回(跑完停在保持) */
 void ecat_motion_run(void);
 

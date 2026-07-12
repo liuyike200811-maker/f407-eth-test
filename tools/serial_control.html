@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>踝关节康复机器人 控制面板</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --text: #1a1a1a; --muted: #6b7280;
+    --border: #d8dbe0; --accent: #2563eb; --accent-hover: #1d4ed8;
+    --ok: #16a34a; --bad: #dc2626; --warn: #d97706;
+    --log-bg: #0d1117; --log-text: #c9d1d9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1100px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; transition: background .15s;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { background: #a8adb5; cursor: not-allowed; }
+  button.danger { background: var(--bad); }
+  button.danger:hover { background: #b91c1c; }
+  button.secondary { background: #6b7280; }
+  button.secondary:hover { background: #4b5563; }
+  input[type=number], input[type=text] {
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px;
+    font-size: 13px; width: 80px;
+  }
+  input[type=text].wide { width: 100%; }
+  label { font-size: 13px; color: var(--muted); min-width: 64px; display: inline-block; }
+  .status { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+  .modebtns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .modebtns button { padding: 12px 4px; font-size: 12px; }
+  #log {
+    background: var(--log-bg); color: var(--log-text); font-family: "SF Mono", Consolas, monospace;
+    font-size: 12.5px; line-height: 1.5; padding: 12px; border-radius: 8px;
+    height: 420px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .paramrow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .paramrow label { min-width: 90px; }
+  .unsupported {
+    background: #fef3c7; border: 1px solid #f59e0b; color: #92400e;
+    padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; display: none;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #15181e; --panel: #1c2028; --text: #e6e8eb; --muted: #8a909c;
+      --border: #2c3138; --log-bg: #0a0c10;
+    }
+  }
+</style>
+</head>
+<body>
+
+<h1>踝关节康复机器人 · 串口控制面板</h1>
+<div class="sub">走 USB Slave 虚拟串口 (CDC), 需要 Chrome/Edge 等支持 Web Serial API 的浏览器, 且必须通过 http:// 本地服务器打开(不能直接双击文件)</div>
+
+<div id="unsupported" class="unsupported">
+  当前浏览器不支持 Web Serial API。请用 Chrome 或 Edge 打开(Firefox/Safari 不支持)。
+</div>
+
+<div class="status">
+  <span class="dot" id="dot"></span>
+  <span id="statusText">未连接</span>
+  <button id="btnConnect">连接串口</button>
+  <button id="btnDisconnect" class="secondary" disabled>断开</button>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>运行模式</h2>
+    <div class="modebtns">
+      <button data-cmd="g0">模式0 波浪</button>
+      <button data-cmd="g1">模式1 跖背</button>
+      <button data-cmd="g2">模式2 内外</button>
+      <button data-cmd="g3">模式3 环形</button>
+      <button data-cmd="g4">模式4 八字</button>
+      <button data-cmd="h">归零 h</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button data-cmd="x" class="danger">急停 x</button>
+      <button data-cmd="q" class="secondary">下电退出 q</button>
+      <button data-cmd="?" class="secondary">查看状态 ?</button>
+    </div>
+
+    <h2 style="margin-top:20px">运动参数</h2>
+    <div class="paramrow">
+      <label>α幅度(度)</label>
+      <input type="number" id="pa" value="20"><button data-param="a" data-src="pa">设 a</button>
+    </div>
+    <div class="paramrow">
+      <label>β幅度(度)</label>
+      <input type="number" id="pb" value="20"><button data-param="b" data-src="pb">设 b</button>
+    </div>
+    <div class="paramrow">
+      <label>频率(厘赫)</label>
+      <input type="number" id="pf" value="25"><button data-param="f" data-src="pf">设 f</button>
+      <span style="color:var(--muted);font-size:12px">25=0.25Hz</span>
+    </div>
+    <div class="paramrow">
+      <label>波幅(mm)</label>
+      <input type="number" id="pw" value="20"><button data-param="w" data-src="pw">设 w</button>
+    </div>
+    <div class="paramrow">
+      <label>升高(mm)</label>
+      <input type="number" id="pr" value="20"><button data-param="r" data-src="pr">设 r</button>
+    </div>
+    <div class="paramrow">
+      <label>循环(次)</label>
+      <input type="number" id="pc" value="3"><button data-param="c" data-src="pc">设 c</button>
+    </div>
+
+    <h2 style="margin-top:20px">自定义命令</h2>
+    <div class="row">
+      <input type="text" id="rawCmd" class="wide" placeholder="例如 g0 / h / a30 (回车发送)">
+      <button id="btnSendRaw">发送</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>板子输出日志</h2>
+    <div id="log"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnClearLog" class="secondary">清空日志</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let port = null, writer = null, reader = null, keepReading = false;
+
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const btnConnect = document.getElementById('btnConnect');
+const btnDisconnect = document.getElementById('btnDisconnect');
+const logEl = document.getElementById('log');
+
+if (!('serial' in navigator)) {
+  document.getElementById('unsupported').style.display = 'block';
+  btnConnect.disabled = true;
+}
+
+function logLine(text, cls) {
+  const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
+  const span = document.createElement('span');
+  if (cls) span.style.color = cls;
+  span.textContent = text;
+  logEl.appendChild(span);
+  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setConnected(on) {
+  dot.classList.toggle('on', on);
+  statusText.textContent = on ? '已连接' : '未连接';
+  btnConnect.disabled = on;
+  btnDisconnect.disabled = !on;
+}
+
+async function connectSerial() {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    setConnected(true);
+    logLine('--- 已连接 ---\n', '#58a6ff');
+    keepReading = true;
+    readLoop();
+  } catch (e) {
+    logLine('连接失败: ' + e.message + '\n', '#f85149');
+  }
+}
+
+async function readLoop() {
+  const textDecoder = new TextDecoderStream();
+  const readableClosed = port.readable.pipeTo(textDecoder.writable).catch(() => {});
+  reader = textDecoder.readable.getReader();
+  try {
+    while (keepReading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) logLine(value);
+    }
+  } catch (e) {
+    logLine('\n--- 读取中断: ' + e.message + ' ---\n', '#f85149');
+  } finally {
+    reader.releaseLock();
+    await readableClosed;
+  }
+}
+
+async function disconnectSerial() {
+  keepReading = false;
+  try { if (reader) await reader.cancel(); } catch (e) {}
+  try { if (writer) { await writer.close(); writer = null; } } catch (e) {}
+  try { if (port) await port.close(); } catch (e) {}
+  port = null;
+  setConnected(false);
+  logLine('--- 已断开 ---\n', '#58a6ff');
+}
+
+async function sendCmd(cmd) {
+  if (!port || !port.writable) { logLine('未连接, 无法发送\n', '#f85149'); return; }
+  try {
+    if (!writer) writer = port.writable.getWriter();
+    const data = new TextEncoder().encode(cmd + '\r\n');
+    await writer.write(data);
+    logLine('>>> ' + cmd + '\n', '#3fb950');
+  } catch (e) {
+    logLine('发送失败: ' + e.message + '\n', '#f85149');
+  } finally {
+    if (writer) { writer.releaseLock(); writer = null; }
+  }
+}
+
+btnConnect.addEventListener('click', connectSerial);
+btnDisconnect.addEventListener('click', disconnectSerial);
+document.getElementById('btnClearLog').addEventListener('click', () => logEl.textContent = '');
+
+document.querySelectorAll('button[data-cmd]').forEach(btn => {
+  btn.addEventListener('click', () => sendCmd(btn.dataset.cmd));
+});
+
+document.querySelectorAll('button[data-param]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const val = document.getElementById(btn.dataset.src).value;
+    sendCmd(btn.dataset.param + val);
+  });
+});
+
+const rawCmdInput = document.getElementById('rawCmd');
+document.getElementById('btnSendRaw').addEventListener('click', () => {
+  if (rawCmdInput.value.trim()) { sendCmd(rawCmdInput.value.trim()); rawCmdInput.value = ''; }
+});
+rawCmdInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && rawCmdInput.value.trim()) {
+    sendCmd(rawCmdInput.value.trim()); rawCmdInput.value = '';
+  }
+});
+
+navigator.serial?.addEventListener('disconnect', () => {
+  logLine('\n--- 设备已拔出 ---\n', '#f85149');
+  setConnected(false);
+});
+</script>
+
+</body>
+</html>
