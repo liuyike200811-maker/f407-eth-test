@@ -26,6 +26,7 @@
 #include "ecat_motion.h"
 #include "uart_log.h"
 #include "usbd_cdc_if.h"
+#include "modbus_slave.h"
 #include "osal.h"
 #include "stm32f4xx_hal.h"   /* 心跳灯(GPIOF/PF9)直接寄存器访问用 */
 #include <string.h>
@@ -87,6 +88,10 @@ static volatile int g_run_request = -1;  /* -1无; 0~4运行对应模式 */
 static volatile int g_do_home     = 0;
 static volatile int g_quit        = 0;
 static volatile int g_abort       = 0;   /* 运动中急停标志 */
+
+/* HMI(Modbus 4x0010/4x0018)反馈用: 运行状态字 与 当前运行模式 */
+static volatile int g_status   = 0;      /* 0启动中 1待机 2运行 3归零 4故障 5已下电 */
+static volatile int g_cur_mode = 99;     /* 0~4=正在跑的模式; 99=待机/无模式 */
 
 static volatile int g_wkc = 0;
 
@@ -194,12 +199,78 @@ static void feed_cmd_byte(char ch)
    }
 }
 
-/* 非阻塞轮询串口, USART1(CH340)和USB Slave(虚拟串口)两路都收。每个通信周期调一次。 */
+/* ================= Modbus (HMI) 对接 ================= */
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* 把 HMI 经 Modbus 写来的设定/命令落到本地全局。
+ * 设定区: 只在 HMI 改动过(值变化)时才落地, 越界截断(兑现契约"越界自动截断"),
+ *         这样串口/USB 命令改的参数不会被每周期原样覆盖。
+ * 控制区: 一次性触发线圈, 受理后清0; 模式/归零仅待机受理, 急停/下电/复位随时受理。*/
+static void modbus_sync(void)
+{
+   static uint16_t shadow[7];
+   static int seeded = 0;
+   if (!seeded) {   /* 用固件默认值播种设定区, 让 HMI 首次读到的是真实默认, 而非0 */
+      modbus_hreg[0] = g_aa_deg;   modbus_hreg[1] = g_ba_deg;   modbus_hreg[2] = g_freq_cHz;
+      modbus_hreg[3] = g_wave_mm;  modbus_hreg[4] = g_rise_mm;  modbus_hreg[5] = g_cycles;
+      modbus_hreg[6] = g_rise_rpm;
+      for (int i = 0; i < 7; i++) shadow[i] = modbus_hreg[i];
+      seeded = 1;
+   }
+   if (modbus_hreg[0] != shadow[0]) { shadow[0] = modbus_hreg[0]; g_aa_deg   = clampi(modbus_hreg[0], 0, 30); }
+   if (modbus_hreg[1] != shadow[1]) { shadow[1] = modbus_hreg[1]; g_ba_deg   = clampi(modbus_hreg[1], 0, 30); }
+   if (modbus_hreg[2] != shadow[2]) { shadow[2] = modbus_hreg[2]; g_freq_cHz = clampi(modbus_hreg[2], 5, 80); }
+   if (modbus_hreg[3] != shadow[3]) { shadow[3] = modbus_hreg[3]; g_wave_mm  = clampi(modbus_hreg[3], 0, 40); }
+   if (modbus_hreg[4] != shadow[4]) { shadow[4] = modbus_hreg[4]; g_rise_mm  = clampi(modbus_hreg[4], 0, 80); }
+   if (modbus_hreg[5] != shadow[5]) { shadow[5] = modbus_hreg[5]; g_cycles   = clampi(modbus_hreg[5], 1, 99); }
+   if (modbus_hreg[6] != shadow[6]) { shadow[6] = modbus_hreg[6]; g_rise_rpm = clampi(modbus_hreg[6], 50, 200); }
+
+   /* 急停/下电/故障复位: 任何时候都响应 */
+   if (modbus_coils[6]) { modbus_coils[6] = 0; g_abort = 1; }
+   if (modbus_coils[7]) { modbus_coils[7] = 0; g_quit  = 1; }
+   if (modbus_coils[8]) { modbus_coils[8] = 0; g_ec_fault = 0; }  /* 清故障显示 */
+
+   /* 模式0~4 / 归零: 仅待机受理; 运行中收到则清掉不执行(防中途乱切, 见契约) */
+   if (g_status == 1) {
+      int req = -1;
+      for (int m = 0; m < 5; m++)
+         if (modbus_coils[m]) { if (req < 0) req = m; modbus_coils[m] = 0; }  /* 多个同ON以先到为准 */
+      if (modbus_coils[5]) { modbus_coils[5] = 0; g_do_home = 1; }
+      else if (req >= 0)   { g_run_request = req; }
+   } else {
+      for (int m = 0; m <= 5; m++) modbus_coils[m] = 0;
+   }
+}
+
+/* 把本地状态回写 Modbus 反馈寄存器(4x0010~4x0018 = 下标16~24)。每周期一次。 */
+static void modbus_write_feedback(void)
+{
+   static uint16_t hb = 0;
+   int32_t p1 = (ctx.slavecount >= 1) ? (read_pos63(1) - start_pos[1]) : 0;
+   int32_t p2 = (ctx.slavecount >= 2) ? (read_pos63(2) - start_pos[2]) : 0;
+   int32_t p3 = (ctx.slavecount >= 3) ? (read_pos63(3) - start_pos[3]) : 0;
+
+   modbus_hreg[16] = (uint16_t)g_status;                    /* 运行状态字 */
+   modbus_hreg[17] = (uint16_t)g_ec_fault;                  /* 故障从站号 */
+   modbus_hreg[18] = (uint16_t)g_ec_slavecount;             /* 在线从站数 */
+   modbus_hreg[19] = (uint16_t)g_wkc;                       /* WKC */
+   modbus_hreg[20] = (uint16_t)(int16_t)(p1 * MM_PER_PULSE * 10.0);  /* 轴1位置 mm×10 有符号 */
+   modbus_hreg[21] = (uint16_t)(int16_t)(p2 * MM_PER_PULSE * 10.0);  /* 轴2 */
+   modbus_hreg[22] = (uint16_t)(int16_t)(p3 * MM_PER_PULSE * 10.0);  /* 轴3 */
+   modbus_hreg[23] = ++hb;                                  /* 心跳(溢出自然归零) */
+   modbus_hreg[24] = (uint16_t)g_cur_mode;                  /* 当前运行模式 */
+}
+
+/* 非阻塞轮询命令通道: USART1(CH340)、USB Slave(虚拟串口)、Modbus/HMI(USART3) 三路并收。
+   每个通信周期调一次 —— 运动中也在调, 故急停/HMI命令运动中同样即时响应。 */
 static void poll_cmd(void)
 {
    int ch;
    while ((ch = uart_rx_getc()) >= 0)  feed_cmd_byte((char)ch);
    while ((ch = usb_cdc_getc()) >= 0)  feed_cmd_byte((char)ch);
+   modbus_poll();            /* 收/解析/应答 Modbus 帧 */
+   modbus_sync();            /* HMI 命令/参数 → 本地全局 */
+   modbus_write_feedback();  /* 本地状态 → 反馈寄存器 */
 }
 
 /* ================= 前馈 + 位置P闭环 ================= */
@@ -346,6 +417,7 @@ static int run_rehab_mode(int mode)
    int i, sl, rc;
    g_abort = 0;
    g_ec_fault = 0;
+   g_status = 2; g_cur_mode = mode;   /* HMI 反馈: 运行中 + 当前模式 */
    motion_reset();
 
    int32_t raise_vel  = (int32_t)((double)g_rise_rpm / 60.0 * PULSE_PER_REV);
@@ -358,7 +430,7 @@ static int run_rehab_mode(int mode)
    /* 阶段1: 上升 */
    rc = move_ramp((double)raise_vel, cruise_frames);
    if (rc < 0) goto stopmsg;
-   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); }
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
    uart_log("  上升完成, 方向锁定: 轴1=%+d 轴2=%+d 轴3=%+d\r\n", fb_sign[1], fb_sign[2], fb_sign[3]);
 
    /* 阶段2: 运动 */
@@ -426,7 +498,7 @@ static int run_rehab_mode(int mode)
    }
 
    /* 阶段3: 下降回原点 */
-   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); }
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
    rc = move_ramp(-(double)raise_vel, cruise_frames);
    if (rc < 0) goto stopmsg;
    /* 末端主动闭环回精确原点 */
@@ -457,6 +529,7 @@ static void run_homing(void)
    int stall_cnt[EC_MAXSLAVE] = {0}, stopped[EC_MAXSLAVE] = {0};
    int32_t vel_cmd[EC_MAXSLAVE];
    g_abort = 0; g_ec_fault = 0;
+   g_status = 3; g_cur_mode = 99;   /* HMI 反馈: 归零中 */
 
    uart_log(">>> 归零: 三轴收缩@%dpulse/s, 堵转自停 <<<\r\n", RETRACT_VEL);
    for (sl = 1; sl <= ctx.slavecount; sl++) vel_cmd[sl] = RETRACT_VEL;
@@ -524,6 +597,7 @@ static int setup_pdo_csv(int slave)
 static void graceful_shutdown(void)
 {
    int i, sl;
+   g_status = 5;   /* HMI 反馈: 已下电 */
    uart_log("下电: 脱力...\r\n");
    for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); }
    ctx.slavelist[0].state = EC_STATE_SAFE_OP;
@@ -536,11 +610,27 @@ static void graceful_shutdown(void)
    uart_log(">>> 已退到 INIT, 可安全断电/拔网线 <<<\r\n");
 }
 
+/* EtherCAT 起不来(网卡失败/没扫到从站)时的降级空转: 不返回, 仍每~4ms服务一次
+ * Modbus/HMI 与串口命令, 让上位机能连上板子看到状态(从站数0、状态=故障), 心跳灯照闪。
+ * 也正是"没接伺服时单测 Modbus"依赖的路径 —— 否则扫不到从站会直接退出, Modbus 一声不吭。*/
+static void modbus_idle_loop(void)
+{
+   g_status = 4;      /* 故障/未就绪(EtherCAT 未建立) */
+   g_cur_mode = 99;
+   uart_log(">>> EtherCAT 未就绪, 进入 Modbus 降级空转(仍可被 HMI/电脑 连接单测) <<<\r\n");
+   for (;;) {
+      poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
+      heartbeat();         /* 心跳灯照闪, 表明没死 */
+      osal_usleep(CYC_US); /* 无 EtherCAT, 相对延时凑 ~4ms 节拍即可 */
+   }
+}
+
 void ecat_motion_run(void)
 {
    int sl, i;
 
    uart_log_init();
+   modbus_init();   /* USART3 上的 Modbus RTU 从站(HMI 用), 与串口命令并行 */
    uart_log("\r\n\r\n===== STM32 SOEM 康复运动 (CSV, 命令驱动) =====\r\n");
 
    uart_log("上次复位原因:");
@@ -554,18 +644,18 @@ void ecat_motion_run(void)
 
    g_ec_phase = 1;
    if (!ecx_init(&ctx, "stm32eth")) {
-      uart_log("[错误] 网卡初始化失败\r\n"); g_ec_phase = -1; return;
+      uart_log("[错误] 网卡初始化失败\r\n"); g_ec_phase = -1; modbus_idle_loop();
    }
    uart_log("网卡就绪, 扫描总线...\r\n");
 
    g_ec_phase = 2;
    if (ecx_config_init(&ctx) <= 0) {
-      uart_log("[错误] 没扫到从站! 检查网线/伺服上电\r\n"); g_ec_phase = -2; ecx_close(&ctx); return;
+      uart_log("[错误] 没扫到从站! 检查网线/伺服上电\r\n"); g_ec_phase = -2; ecx_close(&ctx); modbus_idle_loop();
    }
    g_ec_slavecount = ctx.slavecount;
    uart_log(">>> 扫到 %d 个从站 <<<\r\n", ctx.slavecount);
    for (sl = 1; sl <= ctx.slavecount; sl++) uart_log("    从站%d: %s\r\n", sl, ctx.slavelist[sl].name);
-   if (ctx.slavecount < 1) { g_ec_phase = -2; ecx_close(&ctx); return; }
+   if (ctx.slavecount < 1) { g_ec_phase = -2; ecx_close(&ctx); modbus_idle_loop(); }
 
    /* PRE-OP: 配 CSV 的 PDO */
    g_ec_phase = 3;
@@ -606,8 +696,11 @@ void ecat_motion_run(void)
 
    /* ===== 待机: 听命令 ===== */
    g_ec_phase = 99;
+   for (sl = 1; sl <= ctx.slavecount; sl++) start_pos[sl] = read_pos63(sl);  /* 反馈位置以此刻为0基准, 避免开机显示绝对编码值 */
    uart_log("\r\n>>> 进入待机, 伺服使能保持零速. 发 ? 查看命令. 建议先 h 归零 <<<\r\n");
    while (!g_quit) {
+      g_status = g_ec_fault ? 4 : 1;   /* HMI 反馈: 故障未清则4, 否则待机1 */
+      g_cur_mode = 99;
       for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0);
       cycle();
       poll_cmd();

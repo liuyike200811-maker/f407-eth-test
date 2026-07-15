@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>踝关节康复机器人 · Modbus 控制/测试面板</title>
+<style>
+  :root {
+    --bg:#f4f5f7; --panel:#fff; --text:#1a1a1a; --muted:#6b7280; --border:#d8dbe0;
+    --accent:#2563eb; --accent-hover:#1d4ed8; --ok:#16a34a; --bad:#dc2626; --warn:#d97706;
+    --log-bg:#0d1117; --log-text:#c9d1d9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15181e; --panel:#1c2028; --text:#e6e8eb; --muted:#8a909c; --border:#2c3138; --log-bg:#0a0c10; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--text);
+         font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; max-width:1150px; }
+  @media (max-width:820px){ .grid{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--muted); font-weight:600; }
+  .row { display:flex; align-items:center; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  button { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 14px;
+           font-size:13px; cursor:pointer; transition:background .15s; }
+  button:hover { background:var(--accent-hover); }
+  button:disabled { background:#a8adb5; cursor:not-allowed; }
+  button.danger { background:var(--bad); } button.danger:hover { background:#b91c1c; }
+  button.secondary { background:#6b7280; } button.secondary:hover { background:#4b5563; }
+  input[type=number] { border:1px solid var(--border); border-radius:6px; padding:7px 9px; font-size:13px; width:78px;
+                       background:var(--panel); color:var(--text); }
+  label { font-size:13px; color:var(--muted); min-width:88px; display:inline-block; }
+  .status { display:flex; align-items:center; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--bad); }
+  .dot.on { background:var(--ok); }
+  .modebtns { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .modebtns button { padding:12px 4px; font-size:12px; }
+  .paramrow { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .fb { display:grid; grid-template-columns:auto 1fr; gap:6px 14px; font-size:14px; align-items:center; }
+  .fb .k { color:var(--muted); }
+  .fb .v { font-family:"SF Mono",Consolas,monospace; font-weight:600; }
+  #log { background:var(--log-bg); color:var(--log-text); font-family:"SF Mono",Consolas,monospace;
+         font-size:12px; line-height:1.5; padding:10px; border-radius:8px; height:200px; overflow-y:auto;
+         white-space:pre-wrap; word-break:break-all; }
+  .unsupported { background:#fef3c7; border:1px solid #f59e0b; color:#92400e; padding:12px; border-radius:8px;
+                 margin-bottom:16px; font-size:13px; display:none; }
+  .note { background:rgba(217,119,6,.12); border:1px solid var(--warn); color:var(--warn);
+          padding:10px 12px; border-radius:8px; font-size:12.5px; margin-bottom:14px; }
+</style>
+</head>
+<body>
+
+<h1>踝关节康复机器人 · Modbus 控制/测试面板</h1>
+<div class="sub">走 USB转TTL → 板子 USART3 (Modbus RTU, 站号1, 115200-8N1)。需 Chrome/Edge, 且用 http:// 打开(不能双击文件)。</div>
+
+<div id="unsupported" class="unsupported">当前浏览器不支持 Web Serial API。请用 Chrome 或 Edge 打开。</div>
+
+<div class="note">
+  ⚠ 没接伺服时这是"通讯测试":能看到心跳在跳、能写参数=板子听懂了 Modbus✓。
+  但<b>模式/归零按钮点了不会让机器人动</b>——那要接上伺服 + EtherCAT 起来才行。现在状态会显示"故障/未就绪",正常。
+</div>
+
+<div class="status">
+  <span class="dot" id="dot"></span>
+  <span id="statusText">未连接</span>
+  <button id="btnConnect">连接串口</button>
+  <button id="btnDisconnect" class="secondary" disabled>断开</button>
+  <span style="margin-left:12px" class="sub">通讯: <span class="dot" id="commDot"></span></span>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>控制区 (线圈 0x0000~0x0008)</h2>
+    <div class="modebtns">
+      <button data-coil="0">模式0 波浪</button>
+      <button data-coil="1">模式1 跖背</button>
+      <button data-coil="2">模式2 内外</button>
+      <button data-coil="3">模式3 环形</button>
+      <button data-coil="4">模式4 八字</button>
+      <button data-coil="5">归零</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button data-coil="6" class="danger">急停</button>
+      <button data-coil="7" class="secondary">下电退出</button>
+      <button data-coil="8" class="secondary">故障复位</button>
+    </div>
+
+    <h2 style="margin-top:20px">设定区 (保持寄存器 4x0000~4x0006, 写后自动读回)</h2>
+    <div class="paramrow"><label>α幅度(度)</label><input type="number" id="r0" value="15"><button data-reg="0" data-src="r0">写</button></div>
+    <div class="paramrow"><label>β幅度(度)</label><input type="number" id="r1" value="15"><button data-reg="1" data-src="r1">写</button></div>
+    <div class="paramrow"><label>频率(厘赫)</label><input type="number" id="r2" value="25"><button data-reg="2" data-src="r2">写</button><span class="sub">25=0.25Hz</span></div>
+    <div class="paramrow"><label>波幅(mm)</label><input type="number" id="r3" value="30"><button data-reg="3" data-src="r3">写</button></div>
+    <div class="paramrow"><label>升高(mm)</label><input type="number" id="r4" value="60"><button data-reg="4" data-src="r4">写</button></div>
+    <div class="paramrow"><label>循环(次)</label><input type="number" id="r5" value="9"><button data-reg="5" data-src="r5">写</button></div>
+    <div class="paramrow"><label>升速(RPM)</label><input type="number" id="r6" value="150"><button data-reg="6" data-src="r6">写</button></div>
+    <div class="row"><button id="btnReadSet" class="secondary">读回全部设定值</button></div>
+  </div>
+
+  <div class="panel">
+    <h2>反馈区 (保持寄存器 4x0010~4x0018, 每 0.5s 自动刷新)</h2>
+    <div class="fb">
+      <span class="k">运行状态</span><span class="v" id="f_status">—</span>
+      <span class="k">故障从站号</span><span class="v" id="f_fault">—</span>
+      <span class="k">在线从站数</span><span class="v" id="f_slave">—</span>
+      <span class="k">WKC</span><span class="v" id="f_wkc">—</span>
+      <span class="k">轴1 位置</span><span class="v" id="f_p1">—</span>
+      <span class="k">轴2 位置</span><span class="v" id="f_p2">—</span>
+      <span class="k">轴3 位置</span><span class="v" id="f_p3">—</span>
+      <span class="k">心跳计数</span><span class="v" id="f_hb">—</span>
+      <span class="k">当前模式</span><span class="v" id="f_mode">—</span>
+    </div>
+    <h2 style="margin-top:20px">通讯日志</h2>
+    <div id="log"></div>
+    <div class="row" style="margin-top:8px"><button id="btnClear" class="secondary">清空</button></div>
+  </div>
+</div>
+
+<script>
+const SLAVE = 1;
+const STATUS_TXT = {0:"启动中",1:"待机",2:"运行中",3:"归零中",4:"故障/未就绪",5:"已下电"};
+let port=null, writer=null, localReader=null, rxBuf=[], txnQueue=Promise.resolve(), pollTimer=null;
+let shouldConnect=false, reconnecting=false, failCount=0;
+
+const $=id=>document.getElementById(id);
+const dot=$('dot'), statusText=$('statusText'), commDot=$('commDot');
+
+if(!('serial' in navigator)){ $('unsupported').style.display='block'; $('btnConnect').disabled=true; }
+
+function log(t){ const el=$('log'); const bottom=el.scrollTop+el.clientHeight>=el.scrollHeight-4;
+  el.textContent+=t+"\n"; if(bottom) el.scrollTop=el.scrollHeight; }
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const hex=a=>Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+
+function crc16(bytes){ let crc=0xFFFF;
+  for(const b of bytes){ crc^=b; for(let i=0;i<8;i++) crc=(crc&1)?((crc>>1)^0xA001):(crc>>1); } return crc; }
+function withCrc(arr){ const c=crc16(arr); return arr.concat([c&0xFF,(c>>8)&0xFF]); }
+
+/* 串行化的一次 Modbus 事务: 发帧, 等 expectedLen 字节, 校验 CRC, 返回响应字节数组。
+   关键: txnQueue 只用来"排队"(尾部永不 reject), 否则一次超时会把整条 Promise 链
+   变成已拒绝态, 之后所有请求都不再真正发送 —— 那正是"卡在运行中/写入空/只能刷新"的病根。*/
+function txn(pdu, expectedLen){
+  const run = async()=>{
+    if(!writer) throw new Error("未连接");
+    const frame = withCrc([SLAVE, ...pdu]);
+    rxBuf.length=0;
+    await writer.write(new Uint8Array(frame));
+    const t0=performance.now();
+    while(rxBuf.length<expectedLen && performance.now()-t0<300) await sleep(4);
+    const resp=rxBuf.slice(0,expectedLen);
+    if(resp.length<5) throw new Error(`无响应/超时 (${hex(resp)||'空'})`);
+    if(resp[0]!==SLAVE) throw new Error("站号不对 "+resp[0]);
+    if(resp[1]&0x80) throw new Error("异常码 0x"+resp[2].toString(16));
+    if(crc16(resp.slice(0,-2))!==(resp[resp.length-2]|(resp[resp.length-1]<<8))) throw new Error("CRC错 "+hex(resp));
+    return resp;
+  };
+  const p = txnQueue.then(run, run);   // 无论上一次成功/失败, 本次都照常执行
+  txnQueue = p.catch(()=>{});          // 队列尾吞掉错误, 保证链不被毒化
+  return p;                            // 调用方仍拿到本次真实的结果或错误
+}
+const hi=v=>(v>>8)&0xFF, lo=v=>v&0xFF;
+async function readHolding(start,count){ const r=await txn([0x03,hi(start),lo(start),hi(count),lo(count)],5+count*2);
+  const out=[]; for(let i=0;i<count;i++) out.push((r[3+i*2]<<8)|r[3+i*2+1]); return out; }
+async function writeRegister(addr,val){ await txn([0x06,hi(addr),lo(addr),hi(val),lo(val)],8); }
+async function writeCoil(addr,on){ await txn([0x05,hi(addr),lo(addr), on?0xFF:0x00, 0x00],8); }
+const s16=v=> v>=0x8000 ? v-0x10000 : v;
+
+async function readLoop(){
+  let reader;
+  try{
+    reader=port.readable.getReader(); localReader=reader;
+    while(true){ const {value,done}=await reader.read(); if(done) break;
+      if(value) for(const b of value) rxBuf.push(b); }
+  }catch(e){ /* 读流出错 */ }
+  finally{ try{ reader && reader.releaseLock(); }catch(e){} }
+  if(shouldConnect && !reconnecting) recover();   // 读流意外结束 => 自愈重连
+}
+
+async function teardown(){
+  try{ if(localReader) await localReader.cancel(); }catch(e){}
+  try{ if(writer) writer.releaseLock(); }catch(e){}
+  try{ if(port) await port.close(); }catch(e){}
+  writer=null; localReader=null;
+}
+
+/* 自动重连: 连接僵死时自己关端口重开, 重置队列, 全程无需人工刷新 */
+async function recover(){
+  if(reconnecting || !shouldConnect) return;
+  reconnecting=true; failCount=0; commDot.classList.remove('on');
+  log("--- 通讯中断, 自动重连中... ---");
+  try{
+    await teardown();
+    await sleep(300);
+    await port.open({baudRate:115200, dataBits:8, parity:"none", stopBits:1});
+    writer=port.writable.getWriter();
+    txnQueue=Promise.resolve(); rxBuf.length=0;
+    readLoop();
+    log("--- 自动重连成功 ---");
+    reconnecting=false;
+  }catch(e){
+    log("自动重连失败: "+e.message+", 1.5s 后重试");
+    reconnecting=false; setTimeout(recover,1500);
+  }
+}
+
+function setConnected(on){ dot.classList.toggle('on',on); statusText.textContent=on?'已连接':'未连接';
+  $('btnConnect').disabled=on; $('btnDisconnect').disabled=!on; }
+
+async function connect(){
+  try{
+    port=await navigator.serial.requestPort();
+    await port.open({baudRate:115200, dataBits:8, parity:"none", stopBits:1});
+    writer=port.writable.getWriter();
+    shouldConnect=true; reconnecting=false; failCount=0; txnQueue=Promise.resolve(); rxBuf.length=0;
+    setConnected(true); log("--- 已连接 ---"); readLoop();
+    pollTimer=setInterval(pollFeedback,500);
+  }catch(e){ log("连接失败: "+e.message); }
+}
+async function disconnect(){
+  shouldConnect=false;
+  if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+  await teardown();
+  port=null; setConnected(false); commDot.classList.remove('on'); log("--- 已断开 ---");
+}
+
+async function pollFeedback(){
+  if(reconnecting) return;
+  try{
+    const f=await readHolding(16,9);   // 4x0010~4x0018
+    $('f_status').textContent = f[0]+" ("+(STATUS_TXT[f[0]]||"?")+")";
+    $('f_fault').textContent  = f[1];
+    $('f_slave').textContent  = f[2];
+    $('f_wkc').textContent    = f[3];
+    $('f_p1').textContent     = (s16(f[4])/10).toFixed(1)+" mm";
+    $('f_p2').textContent     = (s16(f[5])/10).toFixed(1)+" mm";
+    $('f_p3').textContent     = (s16(f[6])/10).toFixed(1)+" mm";
+    $('f_hb').textContent     = f[7];
+    $('f_mode').textContent   = f[8]===99 ? "99 (待机)" : f[8];
+    commDot.classList.add('on'); failCount=0;
+  }catch(e){
+    commDot.classList.remove('on');
+    if(++failCount>=5 && !reconnecting){ log("连续无响应, 触发自愈重连"); recover(); }
+  }
+}
+
+$('btnConnect').onclick=connect;
+$('btnDisconnect').onclick=disconnect;
+$('btnClear').onclick=()=>$('log').textContent='';
+
+document.querySelectorAll('button[data-coil]').forEach(b=>b.onclick=async()=>{
+  const c=+b.dataset.coil;
+  try{ await writeCoil(c,true); log(`>>> 写线圈 0x${c.toString(16).padStart(4,'0')} = ON`); }
+  catch(e){ log("线圈写失败: "+e.message); }
+});
+document.querySelectorAll('button[data-reg]').forEach(b=>b.onclick=async()=>{
+  const a=+b.dataset.reg, v=parseInt($( b.dataset.src ).value)||0;
+  try{ await writeRegister(a,v); const back=await readHolding(a,1);
+    log(`>>> 写 4x${a.toString(16).padStart(4,'0')} = ${v}, 读回 ${back[0]} ${back[0]===v?'✓':'✗'}`); }
+  catch(e){ log("寄存器写失败: "+e.message); }
+});
+$('btnReadSet').onclick=async()=>{
+  try{ const s=await readHolding(0,7);
+    for(let i=0;i<7;i++) $('r'+i).value=s[i];
+    log(">>> 读回设定值: "+s.join(', ')); }
+  catch(e){ log("读设定失败: "+e.message); }
+};
+navigator.serial?.addEventListener('disconnect',()=>{ log("--- 设备已拔出 ---"); disconnect(); });
+</script>
+</body>
+</html>

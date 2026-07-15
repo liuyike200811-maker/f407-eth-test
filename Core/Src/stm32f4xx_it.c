@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "stm32f4xx_hal_pcd.h"
 extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
+#include "modbus_slave.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -209,6 +210,14 @@ void SysTick_Handler(void)
 void OTG_FS_IRQHandler(void)
 {
    HAL_PCD_IRQHandler(&hpcd_USB_OTG_FS);
+}
+
+/**
+  * @brief This function handles USART3 global interrupt (Modbus RTU 从站, HMI 用).
+  */
+void USART3_IRQHandler(void)
+{
+   modbus_usart3_isr();
 }
 
 /* USER CODE END 1 */

@@ -70,6 +70,7 @@ SOEM_Port/oshw.c \
 SOEM_Port/stm32_eth.c \
 App/ecat_motion.c \
 App/uart_log.c \
+App/modbus_slave.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \
