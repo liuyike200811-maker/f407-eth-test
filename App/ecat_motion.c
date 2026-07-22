@@ -922,8 +922,24 @@ static void modbus_idle_loop(void)
       if (sensor_get(&r, &p)) {
          if (++print_div >= 12) {   /* 降频: 约 4 行/秒, 既能看清数值又不刷屏 */
             print_div = 0;
-            uart_log("[传感器] Roll=%+7.2f  Pitch=%+7.2f  源=%s\r\n",
-                     r, p, sensor_using_accel() ? "加速度计" : "角度字段");
+            /* ★ 角度字段定位实验: 直接解码载荷里几个候选 int16 为"度", 与加速度角并排打印。
+             * 用法: 把传感器倾斜到30~40度并保持不动, 看 加/候选p20/p22/p24/p30 里谁跟着到30度,
+             * 谁就是真正的角度字段所在字节; 都不动则说明该模式确实没输出欧拉角(该上融合)。*/
+            uint8_t raw[54];
+            uint16_t n = sensor_debug_last_frame(raw, sizeof raw);
+            if (n >= 40) {
+               const uint8_t *pl = raw + 12;   /* 跳过12字节设备ID */
+               #define SW_I16(i) ((int16_t)((uint16_t)pl[i] | ((uint16_t)pl[(i)+1] << 8)))
+               const float A = 180.0f / 32768.0f;   /* raw→度(若量纲不同数值会偏, 但"动没动"照样能判) */
+               uart_log("[传感器] 加速度角 R=%+6.1f P=%+6.1f | 候选(度) p20=%+7.2f p22=%+7.2f p24=%+7.2f p30=%+7.2f | 陀螺 %d %d %d\r\n",
+                        r, p,
+                        SW_I16(20) * A, SW_I16(22) * A, SW_I16(24) * A, SW_I16(30) * A,
+                        (int)SW_I16(14), (int)SW_I16(16), (int)SW_I16(18));
+               #undef SW_I16
+            } else {
+               uart_log("[传感器] Roll=%+7.2f Pitch=%+7.2f 源=%s (帧长%u<40, 无法解候选)\r\n",
+                        r, p, sensor_using_accel() ? "加速度计" : "角度字段", (unsigned)n);
+            }
          }
       }
       poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
