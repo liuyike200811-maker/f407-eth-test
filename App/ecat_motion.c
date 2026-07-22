@@ -68,6 +68,11 @@ static uint8 IOmap[256];
 #define STALL_FRAMES   75           /* 连续多少帧几乎不动才判到位(≈300ms) */
 #define HOME_MAX_FRAMES 7500        /* 归零超时(≈30s) */
 
+/* ---- 测试专用: 传感器独立测试(不接EtherCAT/电缸, 仅读传感器→micro-USB打印) ----
+ * 1=启用: ecat_motion_run() 跳过EtherCAT扫描和所有电缸相关代码, 只读传感器打印。
+ * 0=默认: 正常产线行为, 不受影响。排查完记得改回0重新编译烧录, 不要带着1发布。 */
+#define SENSOR_STANDALONE_TEST 0
+
 /* ---- 可由串口命令修改的运动参数(带安全默认值) ---- */
 static int    g_aa_deg   = 15;      /* α 幅度(度) */
 static int    g_ba_deg   = 15;      /* β 幅度(度) */
@@ -920,6 +925,34 @@ static void modbus_idle_loop(void)
    }
 }
 
+#if SENSOR_STANDALONE_TEST
+/* 独立测试循环: 不返回。只做"读传感器→打印", 不碰EtherCAT/电缸任何东西,
+ * 电缸不接线/不上电都能跑。Modbus/串口命令通道保留(poll_cmd), 方便同时用
+ * HMI或串口终端看心跳、发?查看(从站数会显示0, 属正常, 忽略即可)。 */
+static void sensor_standalone_test(void)
+{
+   uart_log("\r\n>>> 传感器独立测试模式(未接EtherCAT/电缸, 仅读传感器→打印) <<<\r\n");
+   sensor_reset();
+   uint32_t hb = 0;
+   for (;;) {
+      float r, p;
+      if (sensor_get(&r, &p)) {
+         uart_log("[传感器] Roll=%+7.2f Pitch=%+7.2f 源=%s\r\n",
+                  r, p, sensor_using_accel() ? "加速度计" : "角度字段");
+      }
+      poll_cmd();
+      heartbeat();
+      osal_usleep(CYC_US);
+      if (++hb >= 250) {   /* 约1秒一次统计播报 */
+         hb = 0;
+         uart_log("[统计] 帧边界=%lu 有效=%lu 最近失败原因='%c'\r\n",
+                  (unsigned long)sensor_stat_frames, (unsigned long)sensor_stat_valid,
+                  sensor_fail_reason);
+      }
+   }
+}
+#endif
+
 void ecat_motion_run(void)
 {
    int sl, i;
@@ -937,6 +970,10 @@ void ecat_motion_run(void)
    if (g_reset_cause & RCC_CSR_WWDGRSTF) uart_log(" 窗口看门狗复位");
    if (g_reset_cause & RCC_CSR_LPWRRSTF) uart_log(" 低功耗复位");
    uart_log("  (CSR=0x%08lX)\r\n", (unsigned long)g_reset_cause);
+
+#if SENSOR_STANDALONE_TEST
+   sensor_standalone_test();   /* 不返回: 跳过下面所有EtherCAT初始化/电缸相关代码 */
+#endif
 
    g_ec_phase = 1;
    if (!ecx_init(&ctx, "stm32eth")) {
