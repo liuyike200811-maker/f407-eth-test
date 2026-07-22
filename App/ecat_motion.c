@@ -914,52 +914,49 @@ static void modbus_idle_loop(void)
    uart_log(">>> 本路已兼作传感器一手数据监视: 不接电缸时即在此打印 Roll/Pitch 与原始帧 <<<\r\n");
    sensor_reset();      /* 解锁数据源, 让 sensor_get 能重新观测锁源 */
    int hb = 0;
-   int print_div = 0;   /* Roll/Pitch 打印降频计数(50Hz有效帧 → 每12帧打1行 ≈ 4Hz, 防刷屏) */
+   /* ★ 峰值保持诊断: 每1秒窗口内自动记录"绝对值最大"的加速度角/陀螺/候选角, 窗口结束
+    * 打印后清零。无论你何时动、动多快, 峰值都会被抓住 —— 一次即可确认陀螺是否随运动跳数、
+    * 加速度角能否真达到你倾的角度、以及那两个候选角(p22/p24)是不是始终≈0(死字段)。*/
+   float pkR = 0.0f, pkP = 0.0f;          /* 加速度角峰值(带符号, 取|·|最大者) */
+   int   pkGx = 0, pkGy = 0, pkGz = 0;    /* 陀螺原始峰值(|·|最大者) */
+   float pkC22 = 0.0f, pkC24 = 0.0f;      /* 候选角(pl22/pl24)峰值(度) */
    for (;;) {
       /* ★ 关键: 每周期排空并解析传感器帧。原实现从不调 sensor_get(), 帧永远堆在
        * 缓冲里没人取, sensor_fail_reason 也永远停在初值'0' —— 这正是"一直显示0"的根因。*/
       float r, p;
       if (sensor_get(&r, &p)) {
-         if (++print_div >= 12) {   /* 降频: 约 4 行/秒, 既能看清数值又不刷屏 */
-            print_div = 0;
-            /* ★ 角度字段定位实验: 直接解码载荷里几个候选 int16 为"度", 与加速度角并排打印。
-             * 用法: 把传感器倾斜到30~40度并保持不动, 看 加/候选p20/p22/p24/p30 里谁跟着到30度,
-             * 谁就是真正的角度字段所在字节; 都不动则说明该模式确实没输出欧拉角(该上融合)。*/
-            uint8_t raw[54];
-            uint16_t n = sensor_debug_last_frame(raw, sizeof raw);
-            if (n >= 40) {
-               const uint8_t *pl = raw + 12;   /* 跳过12字节设备ID */
-               #define SW_I16(i) ((int16_t)((uint16_t)pl[i] | ((uint16_t)pl[(i)+1] << 8)))
-               const float A = 180.0f / 32768.0f;   /* raw→度(若量纲不同数值会偏, 但"动没动"照样能判) */
-               uart_log("[传感器] 加速度角 R=%+6.1f P=%+6.1f | 候选(度) p20=%+7.2f p22=%+7.2f p24=%+7.2f p30=%+7.2f | 陀螺 %d %d %d\r\n",
-                        r, p,
-                        SW_I16(20) * A, SW_I16(22) * A, SW_I16(24) * A, SW_I16(30) * A,
-                        (int)SW_I16(14), (int)SW_I16(16), (int)SW_I16(18));
-               #undef SW_I16
-            } else {
-               uart_log("[传感器] Roll=%+7.2f Pitch=%+7.2f 源=%s (帧长%u<40, 无法解候选)\r\n",
-                        r, p, sensor_using_accel() ? "加速度计" : "角度字段", (unsigned)n);
-            }
+         if (fabsf(r) > fabsf(pkR)) pkR = r;   /* 累计加速度角峰值 */
+         if (fabsf(p) > fabsf(pkP)) pkP = p;
+         uint8_t raw[54];
+         uint16_t n = sensor_debug_last_frame(raw, sizeof raw);
+         if (n >= 40) {
+            const uint8_t *pl = raw + 12;   /* 跳过12字节设备ID */
+            #define SW_I16(i) ((int16_t)((uint16_t)pl[i] | ((uint16_t)pl[(i)+1] << 8)))
+            const float A = 180.0f / 32768.0f;
+            int gx = SW_I16(14), gy = SW_I16(16), gz = SW_I16(18);   /* 陀螺原始 */
+            if (abs(gx) > abs(pkGx)) pkGx = gx;
+            if (abs(gy) > abs(pkGy)) pkGy = gy;
+            if (abs(gz) > abs(pkGz)) pkGz = gz;
+            float c22 = SW_I16(22) * A, c24 = SW_I16(24) * A;        /* 候选角(当前代码在读的位置) */
+            if (fabsf(c22) > fabsf(pkC22)) pkC22 = c22;
+            if (fabsf(c24) > fabsf(pkC24)) pkC24 = c24;
+            #undef SW_I16
          }
       }
       poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
       heartbeat();         /* 心跳灯照闪, 表明没死 */
       osal_usleep(CYC_US); /* 无 EtherCAT, 相对延时凑 ~4ms 节拍即可 */
-      if (++hb >= 250) {   /* 每约1秒播报 */
+      if (++hb >= 250) {   /* 每约1秒播报一次峰值 + 统计, 然后清零峰值 */
          hb = 0;
          modbus_loopback_selftest_tx();   /* 回环自测: 平时空操作(见 modbus_slave.c 的 MB_LOOPBACK_TEST) */
-         /* 传感器一手诊断: 帧边界数(ISR无条件计)/有效帧/最近失败原因 + 最近一帧原始字节hex。
-          *   帧边界=0        → 板子USART6(PC7)根本没收到字节(查Win转发/接线/GND/波特率)
-          *   帧边界涨,有效=0 → 收到了但全被校验丢弃, 看失败原因和下面的原始hex定位(尤其6轴后布局/版本可能变) */
-         uint8_t raw[54];   /* 传感器帧固定54字节 */
-         uint16_t n = sensor_debug_last_frame(raw, sizeof raw);
-         uart_log("[传感器统计] 帧边界=%lu 有效=%lu 最近失败='%c' 原始%u字节:",
+         /* ★ 决定性一行: 本秒内的峰值。倾斜保持时看 加速度角峰 到没到你倾的角度;
+          * 转动时看 陀螺峰 有没有大数值(证实陀螺可用+位置对); 候选角峰若始终≈0则死字段实锤。*/
+         uart_log("[峰值/秒] 加速度角峰 R=%+6.1f P=%+6.1f | 陀螺峰(raw) x=%d y=%d z=%d | 候选角峰 p22=%+6.2f p24=%+6.2f\r\n",
+                  pkR, pkP, pkGx, pkGy, pkGz, pkC22, pkC24);
+         pkR = pkP = 0.0f; pkGx = pkGy = pkGz = 0; pkC22 = pkC24 = 0.0f;   /* 清零, 开始下一窗口 */
+         uart_log("[传感器统计] 帧边界=%lu 有效=%lu 最近失败='%c'\r\n",
                   (unsigned long)sensor_stat_frames, (unsigned long)sensor_stat_valid,
-                  sensor_fail_reason, (unsigned)n);
-         for (uint16_t i = 0; i < n; i++) uart_log(" %02X", raw[i]);
-         uart_log("\r\n");
-         uart_log("[降级空转] Modbus 收到帧=%lu 有效=%lu\r\n",
-                  (unsigned long)modbus_stat_frames, (unsigned long)modbus_stat_valid);
+                  sensor_fail_reason);
       }
    }
 }
