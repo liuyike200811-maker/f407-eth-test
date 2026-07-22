@@ -28,8 +28,8 @@ OPT = -Og
 # Build path
 BUILD_DIR = build
 
-# SOEM 源码根目录 (工程在 soem-project/stm32/f407-eth-test, SOEM 在 soem-project/SOEM-master)
-SOEM_DIR = ../../SOEM-master
+# SOEM 源码根目录 (工程在 01-STM32固件/f407-eth-test, SOEM 在 01-STM32固件/SOEM-master)
+SOEM_DIR = ../SOEM-master
 
 ######################################
 # source
@@ -71,6 +71,7 @@ SOEM_Port/stm32_eth.c \
 App/ecat_motion.c \
 App/uart_log.c \
 App/modbus_slave.c \
+App/sensor_wt.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \
@@ -226,7 +227,11 @@ $(BUILD_DIR):
 # clean up
 #######################################
 clean:
+ifeq ($(OS),Windows_NT)
+	-if exist $(BUILD_DIR) rmdir /s /q $(BUILD_DIR)
+else
 	-rm -fR $(BUILD_DIR)
+endif
 
 #######################################
 # dependencies

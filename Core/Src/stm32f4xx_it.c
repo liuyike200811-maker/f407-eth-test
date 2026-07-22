@@ -25,6 +25,7 @@
 #include "stm32f4xx_hal_pcd.h"
 extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
 #include "modbus_slave.h"
+#include "sensor_wt.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -218,6 +219,14 @@ void OTG_FS_IRQHandler(void)
 void USART3_IRQHandler(void)
 {
    modbus_usart3_isr();
+}
+
+/**
+  * @brief This function handles USART6 global interrupt (WT901 姿态传感器接入).
+  */
+void USART6_IRQHandler(void)
+{
+   sensor_usart6_isr();
 }
 
 /* USER CODE END 1 */

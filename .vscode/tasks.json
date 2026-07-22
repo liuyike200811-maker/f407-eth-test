@@ -17,11 +17,17 @@
       "detail": "删除 build 产物，等同 Keil 的 Clean"
     },
     {
-      "label": "烧录到板子 (st-flash)",
+      "label": "烧录到板子 (openocd)",
       "type": "shell",
-      "command": "make -j && st-flash --reset write build/f407-eth-test.bin 0x08000000",
+      "command": "openocd",
+      "args": [
+        "-f", "interface/stlink.cfg",
+        "-f", "target/stm32f4x.cfg",
+        "-c", "program build/f407-eth-test.elf verify reset exit"
+      ],
+      "dependsOn": "编译 (make)",
       "problemMatcher": [],
-      "detail": "先编译再烧录，等同 Keil 的 Download。烧完按板子复位键运行"
+      "detail": "先编译再烧录，等同 Keil 的 Download。烧完自动复位运行"
     }
   ]
 }

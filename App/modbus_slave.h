@@ -31,9 +31,15 @@ extern "C" {
 extern volatile uint8_t  modbus_coils[MODBUS_NUM_COILS];
 extern volatile uint16_t modbus_hreg[MODBUS_NUM_HREGS];
 
+/* 联调诊断计数器: frames=收到的帧数(任意内容, 看 RX 有没有字节到);
+   valid=通过站号+CRC的合法帧数(看是不是给本站的正确请求)。 */
+extern volatile uint32_t modbus_stat_frames;
+extern volatile uint32_t modbus_stat_valid;
+
 void modbus_init(void);         /* 初始化 USART3 + NVIC, 调一次 */
 void modbus_poll(void);         /* 有整帧则解析并应答; 每通信周期调一次 */
 void modbus_usart3_isr(void);   /* 供 USART3_IRQHandler() 转调 */
+void modbus_loopback_selftest_tx(void);  /* 回环自测: 平时空操作, 定义 MB_LOOPBACK_TEST 时每调发一串测试字节 */
 
 #ifdef __cplusplus
 }

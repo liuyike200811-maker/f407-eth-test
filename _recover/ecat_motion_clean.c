@@ -83,40 +83,20 @@ static int    g_cycles   = 9;       /* 运动循环数 */
 /* ---- 传感器实时跟随模式(WT901 姿态→踝角→电缸) ---- */
 /* 平滑在【控制周期250Hz】上跑, 不再只在收到帧(~20Hz)时跳一步 —— 否则前馈速度
  * =Δ杆长/4ms 只在收帧那一帧非零, 变成20Hz尖峰串, 被限加速削平后平台几乎不动。
- *
- * ★ 喂入端安全闸(配合 sensor_wt.c 解析层的锁源/范围/尖峰三层校验):
- *   - 增益 1:1 : 原 GAIN=3.0 把手轻微一动放大成大幅倾斜, 是"极不安全"的根因;
- *     康复设备不应放大动作, 平台跟随幅度 ≤ 手部实际倾角(勿设 >1)。
- *   - 角速度硬限幅: 平台目标角每秒最多转 SENSOR_MAX_RATE_DPS 度, 独立于伺服加速度
- *     限幅的角度层物理保护 —— 任何异常输入都不会让平台猛倾。设在"正常跟随峰值之上"
- *     (正常踝运动峰速≈30°/s), 平时不介入, 只封异常; 异常最多持续到下一帧(≈50ms)即被
- *     校验层纠正, 故单次越界幅度极小(≤2~3°)。
- *
- * ★ 抗抖: One-Euro 自适应滤波(静止→截止降到 MINCUT 重滤波消抖; 运动→按角速度抬高截止
- *   轻滤波保跟手), 一举破解定点 EMA"调稳则滞后/调灵则抖"的死结。台架调法:
- *     还抖  → 降 MINCUT(如 0.6) 或 增大 DEADBAND;   跟手发滞后 → 增大 BETA(如 12~20)。 */
-#define SENSOR_GAIN          1.0    /* 角度增益: 手倾角 ×1 = 平台目标角。⚠不要 >1 */
-#define SENSOR_MAX_DEG       20.0   /* 跟随角度包络(度): 限幅, 防逆解出超程杆长(与协议文档一致) */
-#define SENSOR_MAX_RATE_DPS  40.0   /* 平台目标角最大变化率(度/秒): 安全硬限幅(设在正常峰值之上) */
-#define SENSOR_DEADBAND_DEG  0.3    /* 期望角死区(度): 静止时彻底冻结, 消除微抖 */
-#define SENSOR_EURO_MINCUT   1.0    /* One-Euro 最小截止频率(Hz): 越低静止越稳, 略增延迟 */
-#define SENSOR_EURO_BETA     8.0    /* One-Euro 速度系数: 越大运动时越跟手(延迟越小) */
-#define SENSOR_EURO_DCUT     1.0    /* One-Euro 导数低通截止(Hz): 抑制速度估计噪声, 常取 1.0 */
-#define SENSOR_WATCHDOG_FRAMES 75   /* 信号丢失>300ms: 冻结保持当前姿态(短暂丢帧不猛动) */
-#define SENSOR_NEUTRAL_FRAMES  500  /* 信号丢失>2s: 判链路真断, 缓慢(限速)归平到水平最安全姿态 */
-
-/* ---- 传感器→平台 方向符号(台架标定核对; 见 fk_3rps 的世界系约定) ----
- * 修正后世界系: +X=1号, +Y在3号侧, +Z向上, 右手系。传感器 +X 对准1号、水平放置标定。
- * 平台【复现】手的姿态(非镜像): 手向+Y(3号)侧抬→平台+Y(3号)侧抬; 手前端(+X/1号侧)
- * 下沉→平台+X侧下沉。核对: 进跟随后单轴慢慢倾手, 平台若反向, 把对应符号取反即可(仅一处)。
- * (旧版 α 靠"镜像几何×负号"两错抵消而恰好对, β 却是反的; 几何修正后两轴统一取 +1 才对。)*/
-#define SENSOR_SIGN_ALPHA   (+1.0)  /* Roll→α: 反了改 -1.0 */
-#define SENSOR_SIGN_BETA    (+1.0)  /* Pitch→β: 反了改 -1.0 */
-
-/* 标定: 采集足够多"有效帧"求零偏, 并检查离散度(没放稳/数据乱则拒绝, 避免带病零点) */
-#define SENSOR_CAL_MIN_SAMPLES 20   /* 标定所需最少有效帧 */
-#define SENSOR_CAL_MAX_FRAMES  1000 /* 标定最长等待(≈4s), 含解析层锁源观测时间 */
-#define SENSOR_CAL_MAX_STDDEV  3.0  /* 标定期角度标准差上限(度): 超了说明没放稳/数据乱 */
+ * SENSOR_FOLLOW_TAU: 跟随平滑时间常数(s)。越小越跟手/灵敏(幅度足), 越大越稳/滞后。
+ *   经验: 0.05~0.12。要通过手部跟随带宽又能磨平50ms帧台阶, 取略大于帧间隔(0.05s)。*/
+#define SENSOR_FOLLOW_TAU    0.08   /* 跟随平滑时间常数(s), 台架微调此值定手感 */
+#define SENSOR_DEADBAND_DEG  0.3    /* 角度死区(度): 变化小于此值不更新目标, 抑制静止抖动 */
+#define SENSOR_GAIN          3.0    /* 角度增益: 手倾角 × 此倍数 = 平台目标角(再经 MAX 限幅封顶) */
+/* +X(+β, 朝1轴)侧专用增益: 只放大"往+X推"这一侧, 中位(水平)仍=0, 不产生静态偏置。
+ * 根因: 上升阶段三缸都伸→fb_sign锁在"伸"方向; 跟随时 +β 要求 1轴【反向缩回】,
+ * 需跨过换向死区/回程间隙, 故 +X 侧手感明显偏弱。-X(-β)是"继续伸"故正常。
+ * 对策: 给 +β 侧更大目标角 → 更大前馈速度, 一把冲过换向死区。
+ * ★台架试调此值: 太小仍不动, 太大则+X过冲。base=3.0, 起步给 5.0(≈1.7×)往上加。*/
+#define SENSOR_GAIN_BETA_XP  5.0    /* +X(+β)侧增益, >= SENSOR_GAIN */
+#define SENSOR_MAX_DEG       30.0   /* 跟随角度包络(度): 限幅, 防逆解出超程杆长 */
+#define SENSOR_CAL_FRAMES    250    /* 零偏标定采样帧数(≈1s) */
+#define SENSOR_WATCHDOG_FRAMES 75   /* 信号丢失看门狗(≈300ms 无新帧→冻结保持) */
 
 /* ---- 闭环状态(每轴) ---- */
 static int32_t start_pos[EC_MAXSLAVE];   /* 运动起点编码器零点(6063) */
@@ -416,25 +396,18 @@ static int32_t vel_closed(int sl, double v_ff)
 /* 命名提醒: 并联机构里"位姿→杆长"严格是【逆解 IK】(简单/闭式方向);
  *   "杆长→位姿"才是正解 FK(难, 多解, 本工程未做也用不到)。
  *   函数名 fk_ 系历史沿用, 勿被"fk"字样误导成正解。
- *
- * ★ 世界坐标(修正后, 俯视/看向 +Z, 右手系):  +X 精确指向 1号;  +Y 在【3号】那一侧;
- *   +Z 竖直向上。故三作动器真实角位置:  1号=0°,  2号=-120°(在 -Y 半平面),
- *   3号=+120°(在 +Y 半平面)。α=Roll(绕X, 内翻外翻), β=Pitch(绕Y, 跖屈背伸)。
- *   A[i]/B[i] 必须是 slave(i+1) 的真实位置(l_out[i] 直接发给 slave i+1) ——
- *   旧版把 2/3 号写反(A[1]误置+120°/A[2]误置-120°), 导致命令"+Y侧抬"实际驱动了
- *   物理 -Y 侧作动器, roll 方向被镜像。此处已按真实物理布局交换 2、3 号两行修正。
- * R_base=200 r_mov=140, 120°均布。 */
+ * R_base=200 r_mov=140 120°均布; alpha内翻外翻(绕X), beta跖屈背伸(绕Y) */
 static void fk_3rps(double alpha, double beta, double z_eff, double l_out[3])
 {
-   static const double A[3][2] = {          /* 基座锚点(定平台), 单位 mm */
-      { 200.0,   0.0        },              /* 1号 @  0°  (+X) */
-      {-100.0, -173.2050808 },              /* 2号 @-120° (-Y 半平面) */
-      {-100.0,  173.2050808 }               /* 3号 @+120° (+Y 半平面, 即 +Y 在3号侧) */
+   static const double A[3][2] = {
+      { 200.0,   0.0        },
+      {-100.0,  173.2050808 },
+      {-100.0, -173.2050808 }
    };
-   static const double B[3][2] = {          /* 动平台锚点(随位姿旋转), 单位 mm */
-      { 140.0,   0.0        },              /* 1号 @  0° */
-      { -70.0, -121.2435565 },              /* 2号 @-120° */
-      { -70.0,  121.2435565 }               /* 3号 @+120° */
+   static const double B[3][2] = {
+      { 140.0,   0.0        },
+      { -70.0,  121.2435565 },
+      { -70.0, -121.2435565 }
    };
    double ca = cos(alpha), sa = sin(alpha), cb = cos(beta), sb = sin(beta);
    double R[3][3] = {
@@ -626,56 +599,20 @@ stopmsg:
    return rc;
 }
 
-/* ================= One-Euro 自适应滤波(抗抖核心) =================
- * 手持跟随的抖动/延迟本质是同一权衡: 定点低通调稳则滞后, 调灵则抖。One-Euro 让截止
- * 频率随信号角速度自适应 —— 静止时截止降到 MINCUT(重滤波, 抖动被压掉), 运动时按角速度
- * 抬高截止(轻滤波, 跟手不滞后)。这里在【控制周期 250Hz, dt=DT】上跑, 输入是"传感器
- * 设定角(帧间 ZOH 保持)", 输出直接作为平台目标角, 并在最后叠一道角速度硬限幅做安全兜底。*/
-static double one_euro_alpha(double fc, double dt)
-{
-   double tau = 1.0 / (2.0 * M_PI * fc);
-   return 1.0 / (1.0 + tau / dt);
-}
-typedef struct { double xf, dxf, xprev; int init; } euro_t;
-/* 单步滤波 + 角速度硬限幅。x=设定角(rad), 返回滤波并限幅后的平台目标角(rad)。 */
-static double euro_step(euro_t *s, double x, double dt, double max_step)
-{
-   if (!s->init) { s->xf = x; s->dxf = 0.0; s->xprev = x; s->init = 1; return s->xf; }
-   double dxdt = (x - s->xprev) / dt;
-   s->xprev = x;
-   double ad = one_euro_alpha(SENSOR_EURO_DCUT, dt);
-   s->dxf += ad * (dxdt - s->dxf);                          /* 平滑后的角速度估计 */
-   double cutoff = SENSOR_EURO_MINCUT + SENSOR_EURO_BETA * fabs(s->dxf);
-   double a = one_euro_alpha(cutoff, dt);
-   double d = a * (x - s->xf);                              /* 本周期滤波步进 */
-   if (d >  max_step) d =  max_step;                        /* 角速度硬限幅(安全兜底) */
-   if (d < -max_step) d = -max_step;
-   s->xf += d;
-   return s->xf;
-}
-
 /* ================= 传感器实时跟随 (上升→标定→跟随→归平下降) =================
- * 数据流(每一步都是安全闸): 解析层(sensor_wt)已交出【单一锁定源+范围/跳变过滤】后的
- * 原始角 → 减零偏 → ×符号×增益(1:1) → 角度包络限幅 → 死区 → One-Euro自适应滤波 +
- * 角速度硬限幅得平台目标角 → fk_3rps 逆算三电缸目标长 → 相邻帧差分得前馈速度 → vel_closed。
- *
- * 三档信号丢失保护:
- *   ≤300ms  正常帧间保持(不动)
- *   >300ms  冻结当前姿态(短暂丢帧, 不猛动)
- *   >2s     判链路真断 → 目标缓慢(仍受角速度限幅)归平到水平, 患者脚回到最安全位。
- * x 急停随时退出。 */
+ * WT901 姿态 → 减零偏 → EMA → 死区 → 限幅 → fk_3rps 逆算三电缸目标长 →
+ * 相邻帧长度差分得前馈速度 → vel_closed 闭环输出。x 急停退出, 信号丢失自动冻结。 */
 static int run_sensor_mode(void)
 {
    int i, sl, rc = 0;
-   double ta = 0.0, tb = 0.0;          /* 平台实际输出目标角(rad); 退出归平复用 */
-   double want_a = 0.0, want_b = 0.0;  /* 传感器设定角(rad, 经增益/限幅/死区), 帧间保持 */
-   double l_prev[3];                   /* 上一帧 FK 目标杆长(mm), 用于差分求速度 */
+   double ta = 0.0, tb = 0.0;         /* 控制周期平滑后目标角(rad, 相对零偏); 退出归平复用 */
+   double ar_raw = 0.0, br_raw = 0.0; /* 最新传感器目标角(rad), 仅收到帧时刷新, 帧间保持 */
+   double l_prev[3];                  /* 上一帧 FK 目标杆长(mm), 用于差分求速度 */
    float  r, p;
 
    g_abort = 0; g_ec_fault = 0;
    g_status = 2; g_cur_mode = 6;   /* HMI 反馈: 运行中 + 模式6(传感器跟随) */
    motion_reset();
-   sensor_reset();                 /* 清解析层跳变历史 + 解锁数据源, 保证标定/跟随同源 */
 
    int32_t raise_vel  = (int32_t)((double)g_rise_rpm / 60.0 * PULSE_PER_REV);
    int32_t rise_pulse = (int32_t)((double)g_rise_mm * PULSE_PER_REV / LEAD_MM);
@@ -683,7 +620,6 @@ static int run_sensor_mode(void)
    if (cruise_frames < 1) cruise_frames = 1;
    double z_eff  = FK_Z0 + (double)g_rise_mm;
    double ang_lim = SENSOR_MAX_DEG * M_PI / 180.0;
-   double max_step = SENSOR_MAX_RATE_DPS * M_PI / 180.0 * DT;   /* 每控制周期目标角最大步进(rad) */
    fk_3rps(0.0, 0.0, z_eff, l_prev);   /* 基线=标定姿态(零倾斜), 提前初始化防 goto 跳过 */
 
    uart_log(">>> 传感器跟随: 上升%dmm → 零偏标定 → 实时跟随(发 x 退出) <<<\r\n", g_rise_mm);
@@ -694,66 +630,54 @@ static int run_sensor_mode(void)
    for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
    uart_log("  上升完成, 方向锁定: 轴1=%+d 轴2=%+d 轴3=%+d\r\n", fb_sign[1], fb_sign[2], fb_sign[3]);
 
-   /* 阶段2: 零偏标定 —— 平台不动, 采集足够多【有效帧】求均值+离散度
-    * (解析层前几帧在锁源观测, 会返回0, 所以按"有效帧数"而非"控制帧数"计, 且给足超时) */
-   uart_log("  标定中(请把脚踝放到中位并保持不动)...\r\n");
-   double sum_r = 0.0, sum_p = 0.0, sum_r2 = 0.0, sum_p2 = 0.0; int ncal = 0;
-   for (i = 0; i < SENSOR_CAL_MAX_FRAMES && ncal < SENSOR_CAL_MIN_SAMPLES; i++) {
-      if (sensor_get(&r, &p)) {
-         sum_r += r; sum_p += p;
-         sum_r2 += (double)r * r; sum_p2 += (double)p * p; ncal++;
-      }
+   /* 阶段2: 零偏标定 —— 平台保持不动, 采集~1s传感器角度求均值(用户此时把踝置于中位) */
+   uart_log("  标定中(请把脚踝放到中位并保持)...\r\n");
+   double sum_r = 0.0, sum_p = 0.0; int ncal = 0;
+   for (i = 0; i < SENSOR_CAL_FRAMES; i++) {
+      if (sensor_get(&r, &p)) { sum_r += r; sum_p += p; ncal++; }
       for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0));
       cycle(); poll_cmd();
       if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
       if (g_abort)     { rc = -2; goto stopmsg; }
    }
-   if (ncal < SENSOR_CAL_MIN_SAMPLES) {   /* 有效帧不够 → 链路没通/数据全被校验丢弃, 安全退出 */
-      uart_log("!! 标定失败: 仅%d/%d 有效帧, 检查USART6(PC7)/转发/波特率/传感器. 退出.\r\n",
-               ncal, SENSOR_CAL_MIN_SAMPLES);
+   if (ncal < 5) {   /* 标定期几乎没收到帧 → 传感器/转发链路没通, 安全退出 */
+      uart_log("!! 标定失败: 仅收到%d帧, 检查USART6接线(PC7)/电脑转发/波特率. 退出.\r\n", ncal);
       rc = -2; goto stopmsg;
    }
    double roll0 = sum_r / ncal, pitch0 = sum_p / ncal;
-   double var_r = sum_r2 / ncal - roll0 * roll0;   if (var_r < 0) var_r = 0;
-   double var_p = sum_p2 / ncal - pitch0 * pitch0; if (var_p < 0) var_p = 0;
-   double sd_r = sqrt(var_r), sd_p = sqrt(var_p);
-   if (sd_r > SENSOR_CAL_MAX_STDDEV || sd_p > SENSOR_CAL_MAX_STDDEV) {   /* 没放稳/数据跳→零点不可信 */
-      uart_log("!! 标定失败: 数据不稳(σR=%.2f σP=%.2f°>%.1f), 请放稳后重试. 退出.\r\n",
-               sd_r, sd_p, SENSOR_CAL_MAX_STDDEV);
-      rc = -2; goto stopmsg;
-   }
-   uart_log("  标定完成(%d帧): Roll0=%.2f° Pitch0=%.2f° σ(%.2f,%.2f) 源=%s. 开始跟随.\r\n",
-            ncal, roll0, pitch0, sd_r, sd_p, sensor_using_accel() ? "加速度计" : "角度字段");
+   uart_log("  标定完成(%d帧): Roll0=%.2f° Pitch0=%.2f°. 开始跟随.\r\n", ncal, roll0, pitch0);
 
    /* 阶段3: 实时跟随
-    * want_a/want_b 只在收到有效帧时刷新(经符号/增益/限幅/死区), 帧间 ZOH 保持;
-    * ta/tb = One-Euro(want) 每控制周期更新: 静止重滤波消抖、运动轻滤波跟手, 末端再叠
-    * 角速度硬限幅 max_step —— 无论 want 怎么变, 平台角每周期最多挪 max_step, 不会猛倾。 */
-   const double dead = SENSOR_DEADBAND_DEG * M_PI / 180.0;
-   euro_t ea = {0}, eb = {0};
+    * 关键: 目标角 ta/tb 在【每个控制周期(4ms)】朝最新传感器读数 ar_raw/br_raw 平滑逼近,
+    * 而不是只在收到帧(~20Hz)那一帧突跳。这样 (l_now-l_prev)/DT 得到的前馈速度是
+    * 连续的(不再是被限加速削平的20Hz尖峰), 平台幅度/跟手都恢复正常。
+    * ar_raw/br_raw 只在收到帧时刷新, 帧间保持 → 信号丢失即自然冻结在最后目标。 */
+   const double dead    = SENSOR_DEADBAND_DEG * M_PI / 180.0;
+   const double a_ctrl  = DT / (SENSOR_FOLLOW_TAU + DT);   /* 控制周期平滑系数 */
    int lost = 0;
    for (;;) {
       if (sensor_get(&r, &p)) {
          lost = 0;
-         double ar = SENSOR_SIGN_ALPHA * SENSOR_GAIN * ((double)r - roll0)  * M_PI / 180.0;  /* Roll → α(内翻外翻) */
-         double br = SENSOR_SIGN_BETA  * SENSOR_GAIN * ((double)p - pitch0) * M_PI / 180.0;  /* Pitch → β(跖屈背伸) */
-         if (ar >  ang_lim) ar =  ang_lim;                  /* 角度包络限幅(防逆解超程杆长) */
+         double ar = -SENSOR_GAIN * ((double)r - roll0)  * M_PI / 180.0;   /* Roll → α(内翻外翻); 负号消除镜像反向, ×增益放大幅度 */
+         /* Pitch→ β(跖屈背伸)。br>0 = +β = 往+X(1轴)。此侧要1轴反向缩回, 跨换向死区手感弱,
+          * 故对 +β 侧单独用更大增益补偿; -β(-X)侧保持基准增益。中位处 db=0 → br=0, 无静态偏置。 */
+         double db  = (double)p - pitch0;
+         double gb  = (db < 0.0) ? SENSOR_GAIN_BETA_XP : SENSOR_GAIN;   /* db<0 → -GAIN*db>0 → +β → +X, 加大 */
+         double br  = -gb * db * M_PI / 180.0;
+         if (ar >  ang_lim) ar =  ang_lim;                  /* 限幅(防逆解超程杆长) */
          if (ar < -ang_lim) ar = -ang_lim;
          if (br >  ang_lim) br =  ang_lim;
          if (br < -ang_lim) br = -ang_lim;
-         if (fabs(ar - want_a) > dead) want_a = ar;         /* 死区: 静止时冻结, 消除微抖 */
-         if (fabs(br - want_b) > dead) want_b = br;
+         if (ar - ar_raw > dead || ar_raw - ar > dead) ar_raw = ar;   /* 死区: 抑制静止抖动 */
+         if (br - br_raw > dead || br_raw - br > dead) br_raw = br;
       } else {
-         /* 无新帧: 分档处理。>2s 判链路真断, 设定缓慢归平到水平(最安全); 否则冻结保持。 */
-         if (lost < SENSOR_NEUTRAL_FRAMES) lost++;
-         if (lost >= SENSOR_NEUTRAL_FRAMES) { want_a = 0.0; want_b = 0.0; }
-         else if (lost == SENSOR_WATCHDOG_FRAMES)
-            uart_log("  [看门狗] 信号丢失>300ms, 冻结保持姿态\r\n");
+         /* 无新帧: 保持 ar_raw/br_raw 不变; 看门狗超时 → 目标不再变→平台冻结在安全位 */
+         if (lost < SENSOR_WATCHDOG_FRAMES) lost++;
       }
 
-      /* One-Euro 自适应滤波(内含角速度硬限幅) → 平台目标角 */
-      ta = euro_step(&ea, want_a, DT, max_step);
-      tb = euro_step(&eb, want_b, DT, max_step);
+      /* 控制周期平滑: 目标角每帧挪一点, 使前馈速度连续 */
+      ta += a_ctrl * (ar_raw - ta);
+      tb += a_ctrl * (br_raw - tb);
 
       double l_now[3];
       fk_3rps(ta, tb, z_eff, l_now);

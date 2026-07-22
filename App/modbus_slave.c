@@ -9,6 +9,8 @@
 /* ===== 契约寄存器区(主上下文读写) ===== */
 volatile uint8_t  modbus_coils[MODBUS_NUM_COILS];
 volatile uint16_t modbus_hreg[MODBUS_NUM_HREGS];
+volatile uint32_t modbus_stat_frames = 0;
+volatile uint32_t modbus_stat_valid  = 0;
 
 /* ===== 收帧缓冲(ISR 写, 主上下文读) ===== */
 #define MB_BUFSZ 256
@@ -58,6 +60,7 @@ void modbus_usart3_isr(void)
    if (sr & USART_SR_IDLE) {
       (void)USART3->DR;                 /* 读 SR(上面已读)+读 DR 清 IDLE */
       if (rx_len > 0) {
+         modbus_stat_frames++;          /* 一个帧边界: RX 上确实有字节到了 */
          if (!frame_ready) {            /* 上一帧已被主上下文取走才收新帧 */
             for (uint16_t i = 0; i < rx_len; i++) frame_buf[i] = rx_buf[i];
             frame_len   = rx_len;
@@ -95,6 +98,28 @@ static void mb_send(uint8_t *resp, uint16_t n)
    while (!(USART3->SR & USART_SR_TC)) { }   /* 等最后一字节移位完再释放 */
 }
 
+/* ================= 回环自测(联调用, 平时保持关闭) =================
+ * 打开下面那行 #define, 重新编译烧录后, 板子每约1秒往 USART3 发一小串测试字节。
+ * 操作: 把【模块 DB9 的 Pin2 和 Pin3 短接】(HMI 那头先拔掉), 发出去的字节会
+ *       经 MAX3232 绕回 PB11, 于是日志里的 "Modbus 收到帧=X" 会每秒 +1 左右:
+ *    · X 开始涨  -> STM32 USART3 + MAX3232 + 模块DB9 整段都是好的, 病根在 HMI 那侧
+ *    · X 仍为 0  -> 病根在板子这侧(模块坏 / DB9脚位不对 / 固件TX没真发出去)
+ * 测完务必把下面这行重新注释掉, 再烧回正常固件(否则会一直自发自收干扰联调)。 */
+/* #define MB_LOOPBACK_TEST 1 */
+
+void modbus_loopback_selftest_tx(void)
+{
+#ifdef MB_LOOPBACK_TEST
+   /* 0xAA 不是站号1, 环回收到后只会让"收到帧"+1, 不会被当成请求去应答 */
+   static const uint8_t pat[4] = { 0xAA, 0x55, 0xAA, 0x55 };
+   for (uint16_t i = 0; i < sizeof(pat); i++) {
+      while (!(USART3->SR & USART_SR_TXE)) { }
+      USART3->DR = pat[i];
+   }
+   while (!(USART3->SR & USART_SR_TC)) { }   /* 等发完, 让线空闲后触发 IDLE 判帧 */
+#endif
+}
+
 static void mb_exception(uint8_t fc, uint8_t code)
 {
    uint8_t r[4];
@@ -122,6 +147,7 @@ void modbus_poll(void)
    if (mb_crc16(f, len - 2) != (uint16_t)(f[len - 2] | (f[len - 1] << 8)))
       goto done;                                   /* CRC 错, 丢弃 */
 
+   modbus_stat_valid++;                             /* 站号+CRC 都对: 给本站的合法请求 */
    uint8_t  fc = f[1];
    uint16_t start, qty, addr, val;
 
