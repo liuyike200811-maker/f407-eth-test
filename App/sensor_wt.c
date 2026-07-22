@@ -26,8 +26,20 @@
  *   ③ 6轴融合    fusion_update() 更新四元数 → 取欧拉角(roll绕X, pitch绕Y)
  *      │
  *   ④ 收敛预热 + 范围兜底  复位后头 SW_FUSION_WARMUP 帧不产出(等融合收敛); |角|越界丢
+ *      │
+ *   ⑤ 固定低通(本模块最后一步)  见下方"抖动来源"说明
  *
  * 只有全部通过, sensor_get() 才返回 1 并交出角度; 否则出参不动, 上层据此冻结保持。
+ *
+ * 【为什么融合之后还要再加一道固定低通】实测发现融合角对细微动作(哪怕生理性手部
+ * 震颤/传感器本身噪声)反应很灵敏 —— 这本是融合算法的优点(不像旧算法靠"加速度幅值
+ * 门控+跳变拒绝"误伤性地滤掉部分小动作), 但副作用是下游 ecat_motion.c 的死区(0.3°)、
+ * One-Euro 滤波都是按"动得快不快"(角速度)判断要不要放松滤波的, 而抖动/震颤的角速度
+ * 其实也不小(只是幅度小、来回快), 容易被误判成"用户在动"而放行。固定低通不看速度、
+ * 只看【频率】: 抖动通常是高频(约4~12Hz)小幅来回, 真实康复动作是低频(<2~3Hz)单向
+ * 移动, 截止频率卡在两者之间就能专门压高频、放低频, 正好补上速度自适应滤波这个盲区。
+ * 放在本模块【最后一步】(融合之后、范围校验之后), 让 sensor_get() 交出去的就是"已经
+ * 干净"的角度, 下游 ecat_motion.c 的整条处理链(零偏/增益/死区/One-Euro/限速)不用改。
  * ========================================================================
  */
 #include "stm32f4xx_hal.h"
@@ -54,6 +66,9 @@
 #define SW_FUSION_WARMUP     25      /* 复位后预热帧数(≈0.5s @50Hz): 让融合收敛, 此间不产出有效数据 */
 #define SW_FRAME_DT_S        0.02f   /* 帧间隔标称(50Hz); 实际按计数器增量推算, 见 sensor_get */
 
+/* ---- 固定低通(融合之后的最后一步, 频率选择性压噪, 见上方说明) ---- */
+#define SW_LPF_CUTOFF_HZ     2.0f    /* 截止频率(Hz): 卡在"正常康复动作"(<2~3Hz)与"抖动/震颤"(4~12Hz)之间, 台架可调 */
+
 volatile uint32_t sensor_stat_frames = 0;
 volatile uint32_t sensor_stat_valid  = 0;
 volatile char     sensor_fail_reason = '0';
@@ -66,6 +81,10 @@ static int      s_have_counter = 0;
 /* ---- 融合四元数状态(w,x,y,z) + 渐变增益 ---- */
 static float    q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 static float    s_ramp_gain = FUSION_INIT_GAIN;
+
+/* ---- 固定低通状态(融合之后的最后一步) ---- */
+static float    s_lpf_r = 0.0f, s_lpf_p = 0.0f;
+static int      s_lpf_init = 0;   /* 0=下一个有效帧直接作为起点(不引入"从0爬升"的假过渡) */
 
 /* 保留接口: 现全程为融合(加速度+陀螺), 恒返回 1 供上层日志文案沿用。 */
 int sensor_using_accel(void) { return 1; }
@@ -81,6 +100,7 @@ void sensor_reset(void)
    s_warm_n = 0;
    s_have_counter = 0;
    fusion_reset();
+   s_lpf_init = 0;   /* 低通下一帧重新取起点, 避免带着上一次会话的残留值 */
    sensor_fail_reason = '0';
 }
 
@@ -237,7 +257,23 @@ static void fusion_euler(float *roll_deg, float *pitch_deg)
    *pitch_deg = asinf(sinp) * RAD2DEG;
 }
 
-/* ================= 主上下文: 取最新【通过全部校验+融合】的姿态角 ================= */
+/* 固定截止频率一阶低通(非自适应, 与 ecat_motion.c 里 One-Euro 的"按速度调滤波强度"
+ * 不同 —— 这里只按【频率】走, 专门压 SW_LPF_CUTOFF_HZ 以上的高频抖动/震颤, 见顶注。
+ * 首帧(s_lpf_init=0)直接以当前值为起点, 不引入"从0爬升"的假过渡。 */
+static void lpf_step(float cr, float cp, float dt, float *out_r, float *out_p)
+{
+   if (!s_lpf_init) {
+      s_lpf_r = cr; s_lpf_p = cp; s_lpf_init = 1;
+   } else {
+      float tau   = 1.0f / (2.0f * (float)M_PI * SW_LPF_CUTOFF_HZ);
+      float alpha = dt / (tau + dt);
+      s_lpf_r += alpha * (cr - s_lpf_r);
+      s_lpf_p += alpha * (cp - s_lpf_p);
+   }
+   *out_r = s_lpf_r; *out_p = s_lpf_p;
+}
+
+/* ================= 主上下文: 取最新【通过全部校验+融合+低通】的姿态角 ================= */
 int sensor_get(float *roll_deg, float *pitch_deg)
 {
    if (!frame_ready) { sensor_fail_reason = '0'; return 0; }
@@ -293,13 +329,14 @@ int sensor_get(float *roll_deg, float *pitch_deg)
    float cr, cp;
    fusion_euler(&cr, &cp);
 
-   /* 范围兜底 */
+   /* 范围兜底(在低通之前, 用未滤波的原始融合角判, 避免异常值被悄悄磨平后放过) */
    if (fabsf(cr) > SW_MAX_ABS_DEG || fabsf(cp) > SW_MAX_ABS_DEG) {
       sensor_fail_reason = 'R'; return 0;
    }
 
-   *roll_deg  = cr;
-   *pitch_deg = cp;
+   /* ---- ⑤ 固定低通(本模块最后一步, 见顶注"为什么融合之后还要再加一道固定低通") ---- */
+   lpf_step(cr, cp, dt, roll_deg, pitch_deg);
+
    sensor_stat_valid++;
    sensor_fail_reason = '0';
    return 1;
