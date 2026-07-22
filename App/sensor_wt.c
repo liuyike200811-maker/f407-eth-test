@@ -2,26 +2,33 @@
  * 维特 WT901 传感器接入实现 —— USART6 (PC7=RX), 115200 8N1
  * 见 sensor_wt.h 头注释。寄存器级裸写, 风格对齐 modbus_slave.c / uart_log.c。
  *
- * ============================ 安全重写说明 ============================
- * 本模块只负责把"一手串口字节流"变成【可信的姿态角】, 是驱动动平台的第一道闸门。
- * 原实现只校验 帧头/帧尾/版本号, 且每帧都在两个数据源间重新选择 —— 一旦选源翻转
- * 或载荷里出现单 bit 翻转(此私有帧无 checksum), 就会产出一个突变的大角度, 直接把
- * 平台猛推一下。重写引入三层防线:
+ * ===================== 姿态解算: x-io Fusion 6轴 AHRS =====================
+ * 【为什么换成融合】实测(6轴/50Hz)结论:
+ *   - 传感器自带"欧拉角字段"(载荷pl22-25)是死的, 恒为哨兵值 -1 → 不可用。
+ *   - 加速度(pl8-13)与陀螺(pl14-19)均活、随运动正确响应 → 原料齐全。
+ * 原实现只能退回"纯加速度 atan2"解倾角, 它对平台运动时的线加速度敏感(甩一下就被
+ * 骗出假倾角)、双轴解算在大角度还有耦合 —— 这正是"非目标自由度抖动"的根因。
  *
- *   收帧(ISR)           RXNE 攒字节 + IDLE 判帧尾  (未改, 稳定可靠)
+ * 本实现改用 Sebastian Madgwick 的 x-io Fusion 6轴IMU算法(加速度+陀螺, 无磁力计):
+ *   - 陀螺积分给出【平滑、跟手、不受线加速度污染】的姿态变化;
+ *   - 加速度作为【重力绝对基准】持续纠正陀螺漂移;
+ *   - 内置【加速度剔除】: 当 |a| 明显偏离 1g(说明有大线加速度/甩动)时, 本步只信陀螺、
+ *     不用加速度纠偏 —— 从源头挡住"运动时线加速度污染倾角", 根治抖动。
+ *   - 初始化【渐变高增益】: 复位后头几秒用高增益快速收敛到真实姿态, 之后落到稳态增益。
+ *
+ * 数据链路(未改, 稳定可靠):
+ *   收帧(ISR)  RXNE 攒字节 + IDLE 判帧尾
  *      │
- *   ① 结构校验          长度=54 / 帧头"WT" / 帧尾0D0A / 版本13032 / 计数器去重
+ *   ① 结构校验  长度=54 / 帧头"WT" / 帧尾0D0A / 版本13032 / 计数器去重
  *      │
- *   ② 源锁定 + 帧内校验  解锁后头几帧观测哪个源"活着"→锁死; 之后只用锁定源。
- *                       角度越界(|θ|>90°)丢; 加速度源额外要求 |a|∈[0.5,2.0]g
- *                       (排除快速甩动时线性加速度把 atan2 骗出大倾角)。
+ *   ② 输入合理性 陀螺任一轴超量程(bit翻转垃圾)整帧丢; 加速度幅值荒谬整帧丢
  *      │
- *   ③ 帧间尖峰过滤       无 checksum → 用时间一致性兜底: 相邻帧跳变 > 门限的
- *                       "孤立离群帧"先挂起不采信; 下一帧若与之一致才确认(真快速
- *                       运动只延迟一帧≈20ms), 否则丢弃(bit 翻转垃圾被隔离)。
+ *   ③ 6轴融合    fusion_update() 更新四元数 → 取欧拉角(roll绕X, pitch绕Y)
+ *      │
+ *   ④ 收敛预热 + 范围兜底  复位后头 SW_FUSION_WARMUP 帧不产出(等融合收敛); |角|越界丢
  *
  * 只有全部通过, sensor_get() 才返回 1 并交出角度; 否则出参不动, 上层据此冻结保持。
- * ====================================================================
+ * ========================================================================
  */
 #include "stm32f4xx_hal.h"
 #include "sensor_wt.h"
@@ -31,46 +38,49 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ---- 校验/过滤门限(台架微调) ---- */
-#define SW_ANGLE_LSB       (180.0f / 32768.0f)  /* 角度字段 raw→度 */
-#define SW_ACC_LSB         (16.0f  / 32768.0f)  /* 加速度 raw→g   */
-#define SW_MAX_ABS_DEG     90.0f    /* 角度范围校验: 超此值必为错位/垃圾 */
-#define SW_ACC_G_MIN       0.5f     /* 加速度合理幅值下限(g): 低于此说明数据可疑 */
-#define SW_ACC_G_MAX       2.0f     /* 上限: 高于此说明有大线性加速度(甩动), 倾角不可信 */
-#define SW_JUMP_DEG        5.0f     /* 单帧跳变门限(度): 超此的孤立帧先挂起待确认(@50Hz, 20ms/帧, 等效240°/s) */
-#define SW_SRC_OBS_FRAMES  15       /* 锁源观测帧数(≈0.3s @50Hz) */
-#define SW_SRC_ALIVE_DEG   1.0f     /* 观测期角度字段幅值超此即认为"角度源活着" */
+/* ---- 量纲/校验门限(台架微调) ---- */
+#define SW_ACC_LSB         (16.0f   / 32768.0f)  /* 加速度 raw→g   (量程±16g, 已实测: 水平az≈2048=1g) */
+#define SW_GYRO_LSB        (2000.0f / 32768.0f)  /* 陀螺   raw→°/s (量程±2000°/s, WitMotion标准) */
+#define SW_MAX_ABS_DEG     120.0f   /* 融合角范围兜底: 超此必为异常, 丢帧冻结 */
+#define SW_GYRO_SANITY_DPS 1200.0f  /* 陀螺任一轴超此(°/s)判 bit 翻转垃圾, 整帧丢(远高于真实踝/手运动) */
+#define SW_ACC_ABSURD_G    4.0f     /* 加速度幅值超此(g)判荒谬, 整帧丢 */
 
-/* 数据源枚举 */
-#define SRC_UNLOCKED  0
-#define SRC_ANGLE     1
-#define SRC_ACCEL     2
+/* ---- x-io Fusion 参数 ---- */
+#define FUSION_GAIN          0.5f   /* 稳态反馈增益(加速度纠偏权重), x-io默认0.5 */
+#define FUSION_INIT_GAIN     10.0f  /* 初始化高增益: 复位后快速收敛到真实姿态 */
+#define FUSION_INIT_PERIOD_S 3.0f   /* 初始化时长(s): 增益由 INIT_GAIN 线性降到 GAIN */
+#define FUSION_ACC_REJECT_LO 0.75f  /* 加速度剔除下限(g): |a|出[LO,HI]则本步纯陀螺(不用加速度纠偏) */
+#define FUSION_ACC_REJECT_HI 1.25f  /* 上限(g): 挡住甩动/平台运动的线加速度污染 */
+#define SW_FUSION_WARMUP     25      /* 复位后预热帧数(≈0.5s @50Hz): 让融合收敛, 此间不产出有效数据 */
+#define SW_FRAME_DT_S        0.02f   /* 帧间隔标称(50Hz); 实际按计数器增量推算, 见 sensor_get */
 
 volatile uint32_t sensor_stat_frames = 0;
 volatile uint32_t sensor_stat_valid  = 0;
 volatile char     sensor_fail_reason = '0';
 
 /* ---- 解析器状态(主上下文读写, 非 ISR) ---- */
-static int      s_src = SRC_UNLOCKED;   /* 锁定的数据源 */
-static int      s_obs_n = 0;            /* 已观测帧数 */
-static float    s_obs_ang_max = 0.0f;   /* 观测期角度字段最大幅值 */
-static float    s_last_r = 0.0f, s_last_p = 0.0f;
-static int      s_have_last = 0;        /* 已有上一帧有效值(跳变基准) */
-static float    s_pend_r = 0.0f, s_pend_p = 0.0f;
-static int      s_have_pend = 0;        /* 有一个待确认的大跳变候选 */
+static int      s_warm_n = 0;           /* 已预热帧数 */
 static uint32_t s_last_counter = 0;
 static int      s_have_counter = 0;
 
-int sensor_using_accel(void) { return s_src == SRC_ACCEL; }
+/* ---- 融合四元数状态(w,x,y,z) + 渐变增益 ---- */
+static float    q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+static float    s_ramp_gain = FUSION_INIT_GAIN;
+
+/* 保留接口: 现全程为融合(加速度+陀螺), 恒返回 1 供上层日志文案沿用。 */
+int sensor_using_accel(void) { return 1; }
+
+static void fusion_reset(void)
+{
+   q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
+   s_ramp_gain = FUSION_INIT_GAIN;
+}
 
 void sensor_reset(void)
 {
-   s_src = SRC_UNLOCKED;
-   s_obs_n = 0;
-   s_obs_ang_max = 0.0f;
-   s_have_last = 0;
-   s_have_pend = 0;
+   s_warm_n = 0;
    s_have_counter = 0;
+   fusion_reset();
    sensor_fail_reason = '0';
 }
 
@@ -144,34 +154,90 @@ void sensor_usart6_isr(void)
    }
 }
 
-/* 从 40 字节载荷解出角度字段候选(度)。 */
-static void decode_angle_src(const uint8_t *pl, float *r, float *p)
-{
-   int16_t raw_r = (int16_t)((uint16_t)pl[22] | ((uint16_t)pl[23] << 8));
-   int16_t raw_p = (int16_t)((uint16_t)pl[24] | ((uint16_t)pl[25] << 8));
-   *r = (float)raw_r * SW_ANGLE_LSB;
-   *p = (float)raw_p * SW_ANGLE_LSB;
-}
-
-/* 从加速度解出倾角(度), 并回报加速度幅值(g)供合理性门控。
- * roll  = atan2(ay, az)         绕 X → α(内翻外翻)
- * pitch = atan2(-ax, |ayz|)     绕 Y → β(跖屈背伸)  —— 与备忘录轴向一致, 不交换。*/
-static float decode_accel_src(const uint8_t *pl, float *r, float *p)
+/* 从载荷解出加速度(g)与陀螺(°/s)。字节布局经实测确认:
+ *   加速度 pl[8..13]  (X/Y/Z int16 小端), ×16/32768 = g
+ *   陀螺   pl[14..19] (X/Y/Z int16 小端), ×2000/32768 = °/s   */
+static void decode_imu(const uint8_t *pl,
+                       float *ax, float *ay, float *az,
+                       float *gx, float *gy, float *gz)
 {
    int16_t iax = (int16_t)((uint16_t)pl[8]  | ((uint16_t)pl[9]  << 8));
    int16_t iay = (int16_t)((uint16_t)pl[10] | ((uint16_t)pl[11] << 8));
    int16_t iaz = (int16_t)((uint16_t)pl[12] | ((uint16_t)pl[13] << 8));
-   float ax = (float)iax * SW_ACC_LSB;
-   float ay = (float)iay * SW_ACC_LSB;
-   float az = (float)iaz * SW_ACC_LSB;
-   float nyz = sqrtf(ay * ay + az * az);
-   if (nyz < 1e-6f) nyz = 1e-6f;
-   *r = atan2f(ay, az)   * 180.0f / (float)M_PI;
-   *p = atan2f(-ax, nyz) * 180.0f / (float)M_PI;
-   return sqrtf(ax * ax + ay * ay + az * az);   /* |a| in g */
+   int16_t igx = (int16_t)((uint16_t)pl[14] | ((uint16_t)pl[15] << 8));
+   int16_t igy = (int16_t)((uint16_t)pl[16] | ((uint16_t)pl[17] << 8));
+   int16_t igz = (int16_t)((uint16_t)pl[18] | ((uint16_t)pl[19] << 8));
+   *ax = (float)iax * SW_ACC_LSB;  *ay = (float)iay * SW_ACC_LSB;  *az = (float)iaz * SW_ACC_LSB;
+   *gx = (float)igx * SW_GYRO_LSB; *gy = (float)igy * SW_GYRO_LSB; *gz = (float)igz * SW_GYRO_LSB;
 }
 
-/* ================= 主上下文: 取最新【通过全部校验】的帧 ================= */
+/* ================= x-io Fusion 6轴一步更新 =================
+ * gyro 单位 °/s, accel 单位 g, dt 单位 s。更新全局四元数 q0..q3。
+ * 算法即 x-io Fusion 的 FusionAhrsUpdateNoMagnetometer 核心:
+ *   halfGravity = 由四元数估计的重力方向(半量);
+ *   halfFeedback = accel归一化 × halfGravity  (叉积, 指向纠偏方向);
+ *   半角速度 = 0.5*陀螺(rad/s) + 增益*halfFeedback;
+ *   q += (q ⊗ (0,半角速度)) * dt; 归一化。
+ * 加速度剔除: |a|偏离1g过多则本步 halfFeedback=0(纯陀螺积分), 挡住线加速度污染。 */
+static void fusion_update(float gx, float gy, float gz,
+                          float ax, float ay, float az, float dt)
+{
+   const float DEG2RAD = (float)M_PI / 180.0f;
+   float wx = gx * DEG2RAD, wy = gy * DEG2RAD, wz = gz * DEG2RAD;
+
+   /* --- 加速度纠偏(半反馈) --- */
+   float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+   float amag = sqrtf(ax * ax + ay * ay + az * az);
+   if (amag > FUSION_ACC_REJECT_LO && amag < FUSION_ACC_REJECT_HI) {
+      float inv = 1.0f / amag;
+      float axn = ax * inv, ayn = ay * inv, azn = az * inv;   /* 归一化重力测量 */
+      /* 由当前四元数估计的重力方向(半量, 即旋转矩阵第三列/2) */
+      float hgx = q1 * q3 - q0 * q2;
+      float hgy = q0 * q1 + q2 * q3;
+      float hgz = q0 * q0 - 0.5f + q3 * q3;
+      /* 误差 = 测量重力 × 估计重力 (叉积) */
+      fx = ayn * hgz - azn * hgy;
+      fy = azn * hgx - axn * hgz;
+      fz = axn * hgy - ayn * hgx;
+   }
+   /* 渐变增益: 初始化期高增益快速收敛, 之后落到稳态 GAIN */
+   float gain = FUSION_GAIN;
+   if (s_ramp_gain > FUSION_GAIN) {
+      gain = s_ramp_gain;
+      s_ramp_gain -= (FUSION_INIT_GAIN - FUSION_GAIN) * dt / FUSION_INIT_PERIOD_S;
+      if (s_ramp_gain < FUSION_GAIN) s_ramp_gain = FUSION_GAIN;
+   }
+   /* 半角速度 = 0.5*陀螺 + 增益*半反馈 */
+   float hwx = 0.5f * wx + gain * fx;
+   float hwy = 0.5f * wy + gain * fy;
+   float hwz = 0.5f * wz + gain * fz;
+   /* 四元数积分: q += (q ⊗ (0, 半角速度)) * dt */
+   float dq0 = (-q1 * hwx - q2 * hwy - q3 * hwz) * dt;
+   float dq1 = ( q0 * hwx + q2 * hwz - q3 * hwy) * dt;
+   float dq2 = ( q0 * hwy - q1 * hwz + q3 * hwx) * dt;
+   float dq3 = ( q0 * hwz + q1 * hwy - q2 * hwx) * dt;
+   q0 += dq0; q1 += dq1; q2 += dq2; q3 += dq3;
+   /* 归一化 */
+   float n = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+   if (n > 1e-9f) { float inv = 1.0f / n; q0 *= inv; q1 *= inv; q2 *= inv; q3 *= inv; }
+}
+
+/* 四元数 → 欧拉角(度): roll 绕 X(内翻外翻α), pitch 绕 Y(跖屈背伸β)。
+ * 采用标准 aerospace ZYX 提取, 已核对与旧 atan2 加速度解算【符号一致】,
+ * 故 ecat_motion.c 的 SENSOR_SIGN_ALPHA/BETA 无需改动(仍可现场取反核对)。 */
+static void fusion_euler(float *roll_deg, float *pitch_deg)
+{
+   const float RAD2DEG = 180.0f / (float)M_PI;
+   float sinr = 2.0f * (q0 * q1 + q2 * q3);
+   float cosr = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
+   *roll_deg = atan2f(sinr, cosr) * RAD2DEG;
+   float sinp = 2.0f * (q0 * q2 - q3 * q1);
+   if (sinp >  1.0f) sinp =  1.0f;
+   if (sinp < -1.0f) sinp = -1.0f;
+   *pitch_deg = asinf(sinp) * RAD2DEG;
+}
+
+/* ================= 主上下文: 取最新【通过全部校验+融合】的姿态角 ================= */
 int sensor_get(float *roll_deg, float *pitch_deg)
 {
    if (!frame_ready) { sensor_fail_reason = '0'; return 0; }
@@ -197,67 +263,43 @@ int sensor_get(float *roll_deg, float *pitch_deg)
                 | ((uint32_t)pl[6] << 16) | ((uint32_t)pl[7] << 24);
    if (s_have_counter && cnt == s_last_counter) { sensor_fail_reason = 'D'; return 0; }
 
-   /* ---- ② 源锁定 + 帧内校验 ---- */
-   float ar_ang, ap_ang, ar_acc, ap_acc, amag;
-   decode_angle_src(pl, &ar_ang, &ap_ang);
-   amag = decode_accel_src(pl, &ar_acc, &ap_acc);
-
-   if (s_src == SRC_UNLOCKED) {
-      /* 观测期: 累计角度字段幅值, 判它是否"活着"。观测期不产出有效数据(平台此时
-       * 也在标定保持不动), 返回 0。够帧数即锁死数据源。 */
-      float m = fabsf(ar_ang) + fabsf(ap_ang);
-      if (m > s_obs_ang_max) s_obs_ang_max = m;
-      s_last_counter = cnt; s_have_counter = 1;
-      if (++s_obs_n >= SW_SRC_OBS_FRAMES) {
-         s_src = (s_obs_ang_max > SW_SRC_ALIVE_DEG) ? SRC_ANGLE : SRC_ACCEL;
-         s_have_last = 0;   /* 锁定后第一帧用作跳变基准, 不做跳变判定 */
-      }
-      sensor_fail_reason = 'U';
-      return 0;
+   /* 帧间 dt: 按计数器增量推算(丢帧时自动拉长), 异常则退回标称 20ms */
+   float dt = SW_FRAME_DT_S;
+   if (s_have_counter) {
+      uint32_t d = cnt - s_last_counter;
+      if (d >= 1 && d <= 5) dt = (float)d * SW_FRAME_DT_S;   /* 正常/轻微丢帧 */
    }
    s_last_counter = cnt; s_have_counter = 1;
 
-   float cr, cp;
-   if (s_src == SRC_ACCEL) {
-      /* 加速度源: 幅值须落在静态合理区间, 否则(甩动/垃圾)本帧不可信 */
-      if (amag < SW_ACC_G_MIN || amag > SW_ACC_G_MAX) { sensor_fail_reason = 'A'; return 0; }
-      cr = ar_acc; cp = ap_acc;
-   } else {
-      cr = ar_ang; cp = ap_ang;
+   /* ---- ② 输入合理性(bit 翻转垃圾挡在融合之外) ---- */
+   float ax, ay, az, gx, gy, gz;
+   decode_imu(pl, &ax, &ay, &az, &gx, &gy, &gz);
+   if (fabsf(gx) > SW_GYRO_SANITY_DPS ||
+       fabsf(gy) > SW_GYRO_SANITY_DPS ||
+       fabsf(gz) > SW_GYRO_SANITY_DPS)          { sensor_fail_reason = 'J'; return 0; }
+   float amag = sqrtf(ax * ax + ay * ay + az * az);
+   if (amag > SW_ACC_ABSURD_G)                  { sensor_fail_reason = 'A'; return 0; }
+
+   /* ---- ③ 6轴融合更新 ---- */
+   fusion_update(gx, gy, gz, ax, ay, az, dt);
+
+   /* ---- ④ 收敛预热: 复位后头几帧只喂融合、不产出(平台此时也在标定保持不动) ---- */
+   if (s_warm_n < SW_FUSION_WARMUP) {
+      s_warm_n++;
+      sensor_fail_reason = 'U';
+      return 0;
    }
 
-   /* 角度范围校验 */
+   float cr, cp;
+   fusion_euler(&cr, &cp);
+
+   /* 范围兜底 */
    if (fabsf(cr) > SW_MAX_ABS_DEG || fabsf(cp) > SW_MAX_ABS_DEG) {
       sensor_fail_reason = 'R'; return 0;
    }
 
-   /* ---- ③ 帧间尖峰过滤(无 checksum 的兜底: 时间一致性) ---- */
-   if (!s_have_last) {
-      /* 锁定后第一帧: 直接作为基准, 不判跳变 */
-      s_last_r = cr; s_last_p = cp; s_have_last = 1; s_have_pend = 0;
-   } else {
-      float dr = fabsf(cr - s_last_r);
-      float dp = fabsf(cp - s_last_p);
-      if (dr <= SW_JUMP_DEG && dp <= SW_JUMP_DEG) {
-         /* 平稳变化: 接受, 清挂起 */
-         s_last_r = cr; s_last_p = cp; s_have_pend = 0;
-      } else {
-         /* 大跳变: 若与上一次挂起的候选一致 → 是真实快速运动, 采信;
-          * 否则视为孤立离群(bit 翻转垃圾), 挂起本帧等下一帧确认, 本帧不产出。 */
-         if (s_have_pend &&
-             fabsf(cr - s_pend_r) <= SW_JUMP_DEG &&
-             fabsf(cp - s_pend_p) <= SW_JUMP_DEG) {
-            s_last_r = cr; s_last_p = cp; s_have_pend = 0;
-         } else {
-            s_pend_r = cr; s_pend_p = cp; s_have_pend = 1;
-            sensor_fail_reason = 'J';
-            return 0;
-         }
-      }
-   }
-
-   *roll_deg  = s_last_r;
-   *pitch_deg = s_last_p;
+   *roll_deg  = cr;
+   *pitch_deg = cp;
    sensor_stat_valid++;
    sensor_fail_reason = '0';
    return 1;

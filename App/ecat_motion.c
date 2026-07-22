@@ -660,7 +660,7 @@ static double euro_step(euro_t *s, double x, double dt, double max_step)
 }
 
 /* ================= 传感器实时跟随 (上升→标定→跟随→归平下降) =================
- * 数据流(每一步都是安全闸): 解析层(sensor_wt)已交出【单一锁定源+范围/跳变过滤】后的
+ * 数据流(每一步都是安全闸): 解析层(sensor_wt)已交出【6轴融合(加速度+陀螺, 含加速度剔除)】后的
  * 原始角 → 减零偏 → ×符号×增益(1:1) → 角度包络限幅 → 死区 → One-Euro自适应滤波 +
  * 角速度硬限幅得平台目标角 → fk_3rps 逆算三电缸目标长 → 相邻帧差分得前馈速度 → vel_closed。
  *
@@ -727,8 +727,8 @@ static int run_sensor_mode(void)
                sd_r, sd_p, SENSOR_CAL_MAX_STDDEV);
       rc = -2; goto stopmsg;
    }
-   uart_log("  标定完成(%d帧): Roll0=%.2f° Pitch0=%.2f° σ(%.2f,%.2f) 源=%s. 开始跟随.\r\n",
-            ncal, roll0, pitch0, sd_r, sd_p, sensor_using_accel() ? "加速度计" : "角度字段");
+   uart_log("  标定完成(%d帧): Roll0=%.2f° Pitch0=%.2f° σ(%.2f,%.2f) 源=6轴融合. 开始跟随.\r\n",
+            ncal, roll0, pitch0, sd_r, sd_p);
 
    /* 阶段3: 实时跟随
     * want_a/want_b 只在收到有效帧时刷新(经符号/增益/限幅/死区), 帧间 ZOH 保持;
@@ -912,48 +912,30 @@ static void modbus_idle_loop(void)
    g_cur_mode = 99;
    uart_log(">>> EtherCAT 未就绪, 进入 Modbus 降级空转(仍可被 HMI/电脑 连接单测) <<<\r\n");
    uart_log(">>> 本路已兼作传感器一手数据监视: 不接电缸时即在此打印 Roll/Pitch 与原始帧 <<<\r\n");
-   sensor_reset();      /* 解锁数据源, 让 sensor_get 能重新观测锁源 */
+   sensor_reset();      /* 复位融合四元数+预热, 让 sensor_get 从头收敛 */
    int hb = 0;
-   /* ★ 峰值保持诊断: 每1秒窗口内自动记录"绝对值最大"的加速度角/陀螺/候选角, 窗口结束
-    * 打印后清零。无论你何时动、动多快, 峰值都会被抓住 —— 一次即可确认陀螺是否随运动跳数、
-    * 加速度角能否真达到你倾的角度、以及那两个候选角(p22/p24)是不是始终≈0(死字段)。*/
-   float pkR = 0.0f, pkP = 0.0f;          /* 加速度角峰值(带符号, 取|·|最大者) */
-   int   pkGx = 0, pkGy = 0, pkGz = 0;    /* 陀螺原始峰值(|·|最大者) */
-   float pkC22 = 0.0f, pkC24 = 0.0f;      /* 候选角(pl22/pl24)峰值(度) */
+   /* ★ 峰值保持诊断(现读的是6轴融合后的姿态角): 每1秒窗口内记录|·|最大的 融合角(R/P),
+    * 窗口末打印后清零。倾斜保持时看融合角峰能否达到你倾的角度; 静止看是否稳定≈零偏。*/
+   float pkR = 0.0f, pkP = 0.0f;          /* 融合角峰值(带符号, 取|·|最大者) */
+   float lastR = 0.0f, lastP = 0.0f;      /* 最近一帧融合角(看静止时稳不稳) */
    for (;;) {
-      /* ★ 关键: 每周期排空并解析传感器帧。原实现从不调 sensor_get(), 帧永远堆在
-       * 缓冲里没人取, sensor_fail_reason 也永远停在初值'0' —— 这正是"一直显示0"的根因。*/
+      /* ★ 关键: 每周期排空并解析传感器帧(现内部跑6轴融合)。原实现从不调 sensor_get(),
+       * 帧永远堆在缓冲里没人取, sensor_fail_reason 也停在'0' —— 曾是"一直显示0"的根因。*/
       float r, p;
       if (sensor_get(&r, &p)) {
-         if (fabsf(r) > fabsf(pkR)) pkR = r;   /* 累计加速度角峰值 */
+         lastR = r; lastP = p;
+         if (fabsf(r) > fabsf(pkR)) pkR = r;
          if (fabsf(p) > fabsf(pkP)) pkP = p;
-         uint8_t raw[54];
-         uint16_t n = sensor_debug_last_frame(raw, sizeof raw);
-         if (n >= 40) {
-            const uint8_t *pl = raw + 12;   /* 跳过12字节设备ID */
-            #define SW_I16(i) ((int16_t)((uint16_t)pl[i] | ((uint16_t)pl[(i)+1] << 8)))
-            const float A = 180.0f / 32768.0f;
-            int gx = SW_I16(14), gy = SW_I16(16), gz = SW_I16(18);   /* 陀螺原始 */
-            if (abs(gx) > abs(pkGx)) pkGx = gx;
-            if (abs(gy) > abs(pkGy)) pkGy = gy;
-            if (abs(gz) > abs(pkGz)) pkGz = gz;
-            float c22 = SW_I16(22) * A, c24 = SW_I16(24) * A;        /* 候选角(当前代码在读的位置) */
-            if (fabsf(c22) > fabsf(pkC22)) pkC22 = c22;
-            if (fabsf(c24) > fabsf(pkC24)) pkC24 = c24;
-            #undef SW_I16
-         }
       }
       poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
       heartbeat();         /* 心跳灯照闪, 表明没死 */
       osal_usleep(CYC_US); /* 无 EtherCAT, 相对延时凑 ~4ms 节拍即可 */
-      if (++hb >= 250) {   /* 每约1秒播报一次峰值 + 统计, 然后清零峰值 */
+      if (++hb >= 250) {   /* 每约1秒播报一次融合角当前值+峰值+统计, 然后清零峰值 */
          hb = 0;
          modbus_loopback_selftest_tx();   /* 回环自测: 平时空操作(见 modbus_slave.c 的 MB_LOOPBACK_TEST) */
-         /* ★ 决定性一行: 本秒内的峰值。倾斜保持时看 加速度角峰 到没到你倾的角度;
-          * 转动时看 陀螺峰 有没有大数值(证实陀螺可用+位置对); 候选角峰若始终≈0则死字段实锤。*/
-         uart_log("[峰值/秒] 加速度角峰 R=%+6.1f P=%+6.1f | 陀螺峰(raw) x=%d y=%d z=%d | 候选角峰 p22=%+6.2f p24=%+6.2f\r\n",
-                  pkR, pkP, pkGx, pkGy, pkGz, pkC22, pkC24);
-         pkR = pkP = 0.0f; pkGx = pkGy = pkGz = 0; pkC22 = pkC24 = 0.0f;   /* 清零, 开始下一窗口 */
+         uart_log("[融合角] 当前 R=%+6.1f P=%+6.1f | 本秒峰 R=%+6.1f P=%+6.1f\r\n",
+                  lastR, lastP, pkR, pkP);
+         pkR = pkP = 0.0f;   /* 清零, 开始下一窗口 */
          uart_log("[传感器统计] 帧边界=%lu 有效=%lu 最近失败='%c'\r\n",
                   (unsigned long)sensor_stat_frames, (unsigned long)sensor_stat_valid,
                   sensor_fail_reason);
@@ -973,8 +955,7 @@ static void sensor_standalone_test(void)
    for (;;) {
       float r, p;
       if (sensor_get(&r, &p)) {
-         uart_log("[传感器] Roll=%+7.2f Pitch=%+7.2f 源=%s\r\n",
-                  r, p, sensor_using_accel() ? "加速度计" : "角度字段");
+         uart_log("[传感器] Roll=%+7.2f Pitch=%+7.2f 源=6轴融合\r\n", r, p);
       }
       poll_cmd();
       heartbeat();
