@@ -914,13 +914,17 @@ static void modbus_idle_loop(void)
    uart_log(">>> 本路已兼作传感器一手数据监视: 不接电缸时即在此打印 Roll/Pitch 与原始帧 <<<\r\n");
    sensor_reset();      /* 解锁数据源, 让 sensor_get 能重新观测锁源 */
    int hb = 0;
+   int print_div = 0;   /* Roll/Pitch 打印降频计数(50Hz有效帧 → 每12帧打1行 ≈ 4Hz, 防刷屏) */
    for (;;) {
       /* ★ 关键: 每周期排空并解析传感器帧。原实现从不调 sensor_get(), 帧永远堆在
        * 缓冲里没人取, sensor_fail_reason 也永远停在初值'0' —— 这正是"一直显示0"的根因。*/
       float r, p;
       if (sensor_get(&r, &p)) {
-         uart_log("[传感器] Roll=%+7.2f  Pitch=%+7.2f  源=%s\r\n",
-                  r, p, sensor_using_accel() ? "加速度计" : "角度字段");
+         if (++print_div >= 12) {   /* 降频: 约 4 行/秒, 既能看清数值又不刷屏 */
+            print_div = 0;
+            uart_log("[传感器] Roll=%+7.2f  Pitch=%+7.2f  源=%s\r\n",
+                     r, p, sensor_using_accel() ? "加速度计" : "角度字段");
+         }
       }
       poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
       heartbeat();         /* 心跳灯照闪, 表明没死 */
