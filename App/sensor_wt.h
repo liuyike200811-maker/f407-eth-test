@@ -56,4 +56,8 @@ extern volatile char     sensor_fail_reason;
 /* 锁定后的数据源: 1=加速度计解算, 0=角度字段(或尚未锁定) */
 int sensor_using_accel(void);
 
+/* 调试: 拷贝最近一个帧边界的原始字节到 out(最多 max), 返回实际字节数。
+ * 无论有没有过校验都更新, 供降级空转/独立测试直接 hexdump 一手数据。 */
+uint16_t sensor_debug_last_frame(uint8_t *out, uint16_t max);
+
 #endif /* SENSOR_WT_H */

@@ -911,14 +911,33 @@ static void modbus_idle_loop(void)
    g_status = 4;      /* 故障/未就绪(EtherCAT 未建立) */
    g_cur_mode = 99;
    uart_log(">>> EtherCAT 未就绪, 进入 Modbus 降级空转(仍可被 HMI/电脑 连接单测) <<<\r\n");
+   uart_log(">>> 本路已兼作传感器一手数据监视: 不接电缸时即在此打印 Roll/Pitch 与原始帧 <<<\r\n");
+   sensor_reset();      /* 解锁数据源, 让 sensor_get 能重新观测锁源 */
    int hb = 0;
    for (;;) {
+      /* ★ 关键: 每周期排空并解析传感器帧。原实现从不调 sensor_get(), 帧永远堆在
+       * 缓冲里没人取, sensor_fail_reason 也永远停在初值'0' —— 这正是"一直显示0"的根因。*/
+      float r, p;
+      if (sensor_get(&r, &p)) {
+         uart_log("[传感器] Roll=%+7.2f  Pitch=%+7.2f  源=%s\r\n",
+                  r, p, sensor_using_accel() ? "加速度计" : "角度字段");
+      }
       poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
       heartbeat();         /* 心跳灯照闪, 表明没死 */
       osal_usleep(CYC_US); /* 无 EtherCAT, 相对延时凑 ~4ms 节拍即可 */
-      if (++hb >= 250) {   /* 每约1秒播报, 便于终端实时监看 Modbus 是否收到 HMI 请求 */
+      if (++hb >= 250) {   /* 每约1秒播报 */
          hb = 0;
          modbus_loopback_selftest_tx();   /* 回环自测: 平时空操作(见 modbus_slave.c 的 MB_LOOPBACK_TEST) */
+         /* 传感器一手诊断: 帧边界数(ISR无条件计)/有效帧/最近失败原因 + 最近一帧原始字节hex。
+          *   帧边界=0        → 板子USART6(PC7)根本没收到字节(查Win转发/接线/GND/波特率)
+          *   帧边界涨,有效=0 → 收到了但全被校验丢弃, 看失败原因和下面的原始hex定位(尤其6轴后布局/版本可能变) */
+         uint8_t raw[54];   /* 传感器帧固定54字节 */
+         uint16_t n = sensor_debug_last_frame(raw, sizeof raw);
+         uart_log("[传感器统计] 帧边界=%lu 有效=%lu 最近失败='%c' 原始%u字节:",
+                  (unsigned long)sensor_stat_frames, (unsigned long)sensor_stat_valid,
+                  sensor_fail_reason, (unsigned)n);
+         for (uint16_t i = 0; i < n; i++) uart_log(" %02X", raw[i]);
+         uart_log("\r\n");
          uart_log("[降级空转] Modbus 收到帧=%lu 有效=%lu\r\n",
                   (unsigned long)modbus_stat_frames, (unsigned long)modbus_stat_valid);
       }

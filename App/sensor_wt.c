@@ -82,6 +82,11 @@ static volatile uint8_t  frame_buf[SW_BUFSZ];
 static volatile uint16_t frame_len = 0;
 static volatile uint8_t  frame_ready = 0;   /* 1=frame_buf 有整帧待主上下文解析 */
 
+/* 调试: 无条件保留"最近一个帧边界"的原始字节(不受 frame_ready 门控影响),
+ * 供降级空转/独立测试直接 hexdump 一手数据, 判断链路通没通、字节布局对不对。 */
+static volatile uint8_t  dbg_buf[SW_BUFSZ];
+static volatile uint16_t dbg_len = 0;
+
 #define SW_FRAME_LEN  54       /* 12(ID) + 40(载荷) + 2(0D 0A) */
 
 /* ================= 初始化 ================= */
@@ -126,6 +131,9 @@ void sensor_usart6_isr(void)
       (void)USART6->DR;                 /* 读 SR(上面已读)+读 DR 清 IDLE */
       if (rx_len > 0) {
          sensor_stat_frames++;          /* 一个帧边界 */
+         /* 调试快照: 每个帧边界都无条件更新, 即使主上下文没来取(frame_ready=1) */
+         dbg_len = rx_len;
+         for (uint16_t i = 0; i < rx_len; i++) dbg_buf[i] = rx_buf[i];
          if (!frame_ready) {            /* 上一帧已被主上下文取走才收新帧 */
             for (uint16_t i = 0; i < rx_len; i++) frame_buf[i] = rx_buf[i];
             frame_len   = rx_len;
@@ -262,4 +270,16 @@ void sensor_tx_byte(uint8_t b)
 {
    while (!(USART6->SR & USART_SR_TXE)) { }
    USART6->DR = b;
+}
+
+/* ================= 调试: 取最近一个帧边界的原始字节 =================
+ * 把最近收到(不管有没有过校验)的一帧原始字节拷进 out(最多 max 字节),
+ * 返回实际字节数。用于降级空转/独立测试直接 hexdump 一手数据。
+ * 非原子(ISR 可能正在写), 偶发一帧撕裂可接受 —— 仅诊断用。 */
+uint16_t sensor_debug_last_frame(uint8_t *out, uint16_t max)
+{
+   uint16_t n = dbg_len;
+   if (n > max) n = max;
+   for (uint16_t i = 0; i < n; i++) out[i] = dbg_buf[i];
+   return n;
 }
