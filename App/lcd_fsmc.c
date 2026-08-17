@@ -140,9 +140,10 @@ static void lcd_panel_init_hx8357dn(void)
    lcd_wr_cmd(0xD0);
    lcd_wr_data(0x07); lcd_wr_data(0x07); lcd_wr_data(0x80);
 
-   lcd_wr_cmd_data(0x36, 0x2C);   /* Set_address_mode: 横屏(取代官方init里的0x4c,
-                                      与官方LCD_Display_Dir(1)最终写入值一致) */
-   g_width = 480; g_height = 320;
+   lcd_wr_cmd_data(0x36, 0x4C);   /* Set_address_mode: 竖屏(官方dir=0默认值; 实测
+                                      物理板子是竖放的, 用横屏值(0x2C)会导致内容
+                                      整体转90°——左右三条竖色块被转成上下三条) */
+   g_width = 320; g_height = 480;
 
    lcd_wr_cmd(0xC1);
    lcd_wr_data(0x10); lcd_wr_data(0x10); lcd_wr_data(0x02); lcd_wr_data(0x02);
