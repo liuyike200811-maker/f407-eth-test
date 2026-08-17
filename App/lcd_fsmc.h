@@ -51,6 +51,10 @@ void lcd_fill_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t 
 /* 单点画点 */
 void lcd_draw_pixel(uint16_t x, uint16_t y, uint16_t color);
 
+/* 把一块像素数组(RGB565, 按行优先连续排列, 长度=(x1-x0+1)*(y1-y0+1))写进
+ * (x0,y0)~(x1,y1)窗口。供LVGL显示驱动的flush回调用, 逐像素调lcd_wr_color。 */
+void lcd_blit(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, const uint16_t *pixels);
+
 /* 背光开关 */
 void lcd_backlight(int on);
 

@@ -73,6 +73,7 @@ App/uart_log.c \
 App/modbus_slave.c \
 App/sensor_wt.c \
 App/lcd_fsmc.c \
+App/lv_port_disp.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \
@@ -86,6 +87,11 @@ $(SOEM_DIR)/src/ec_foe.c \
 $(SOEM_DIR)/src/ec_main.c \
 $(SOEM_DIR)/src/ec_print.c \
 $(SOEM_DIR)/src/ec_soe.c
+
+# LVGL(GUI库, Middlewares/lvgl/) 源文件数量多(192个.c), 用find而不是手写列表;
+# vpath+notdir机制要求跨全项目文件名不重复, LVGL自身内部已核对过没有重名。
+LVGL_SOURCES = $(shell find Middlewares/lvgl/src -name '*.c')
+C_SOURCES += $(LVGL_SOURCES)
 
 # ASM sources
 ASM_SOURCES =  \
@@ -159,7 +165,8 @@ C_INCLUDES =  \
 -IDrivers/CMSIS/Device/ST/STM32F4xx/Include \
 -IDrivers/CMSIS/Include \
 -IMiddlewares/ST/STM32_USB_Device_Library/Core/Inc \
--IMiddlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc
+-IMiddlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc \
+-IMiddlewares/lvgl
 
 
 # compile gcc flags

@@ -166,6 +166,21 @@ SECTIONS
     _edata = .;        /* define a global symbol at data end */
   } >RAM AT> FLASH
 
+  /* CCM-RAM 零初始化区(NOLOAD, 不占Flash镜像) —— 主RAM(128K)已经被SOEM的ctx
+   * 结构体占掉约90KB, 放不下LVGL的堆池, 挪到这块原本完全空闲的64KB CCMRAM。
+   * 必须放在下面 .ccmram 段之前: 那个段用 *(.ccmram*) 通配符匹配, 顺序在后
+   * 会把本段名字也吞进去, 变成"从Flash加载初值"的语义(不是这里要的零初始化)。
+   * ⚠ CCMRAM 访问不到 DMA控制器——本项目LCD驱动逐像素阻塞写、不用DMA, 现在
+   * 没问题; 以后如果给屏幕刷新接DMA, 这块内存不能用作DMA源/目的地。 */
+  .ccmram_bss (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _sccmram_bss = .;
+    *(.ccmram_bss)
+    . = ALIGN(4);
+    _eccmram_bss = .;
+  } >CCMRAM
+
   _siccmram = LOADADDR(.ccmram);
 
   /* CCM-RAM section

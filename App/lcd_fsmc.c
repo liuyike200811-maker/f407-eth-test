@@ -264,6 +264,16 @@ void lcd_draw_pixel(uint16_t x, uint16_t y, uint16_t color)
    lcd_wr_color(color);
 }
 
+void lcd_blit(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, const uint16_t *pixels)
+{
+   uint32_t n, total;
+
+   if (x0 > x1 || y0 > y1) return;
+   lcd_set_window(x0, y0, x1, y1);
+   total = (uint32_t)(x1 - x0 + 1) * (uint32_t)(y1 - y0 + 1);
+   for (n = 0; n < total; n++) lcd_wr_color(pixels[n]);
+}
+
 void lcd_backlight(int on)
 {
    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, on ? GPIO_PIN_SET : GPIO_PIN_RESET);

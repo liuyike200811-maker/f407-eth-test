@@ -21,6 +21,8 @@
 #include "ecat_motion.h"
 #include "usb_device.h"
 #include "lcd_fsmc.h"
+#include "lvgl.h"
+#include "lv_port_disp.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -129,12 +131,20 @@ int main(void)
   /* USER CODE BEGIN 2 */
   MX_USB_DEVICE_Init();   /* USB Slave(Micro-USB, PA11/PA12) 枚举成CDC虚拟串口 */
 
-  /* --- LCD点亮验证(阶段1): 只测总线+面板初始化+基本画图对不对, 三色竖条
-         验证RGB565通道顺序; 确认屏幕物理OK后这段测试图案会被开机动画取代。 --- */
+  /* --- LVGL点亮验证(阶段3): 总线/面板已经在阶段1核对过, 这里换成LVGL冒烟
+         测试——建个真的label控件逼链接器把控件/绘制代码都编进来, 顺便验证
+         CCMRAM放LVGL堆池+刷新缓冲区这套内存布局链接/运行没问题。真正的开机
+         动画/主页/日志页在后面几次提交里逐步接上, 取代这段测试代码。 --- */
   lcd_init();
-  lcd_fill_rect(0,                 0, lcd_width()/3 - 1,     lcd_height() - 1, LCD_COLOR_RED);
-  lcd_fill_rect(lcd_width()/3,     0, lcd_width()*2/3 - 1,   lcd_height() - 1, LCD_COLOR_GREEN);
-  lcd_fill_rect(lcd_width()*2/3,   0, lcd_width() - 1,       lcd_height() - 1, LCD_COLOR_BLUE);
+  lv_init();
+  lv_port_disp_init();
+  {
+     lv_obj_t *scr = lv_scr_act();
+     lv_obj_t *label = lv_label_create(scr);
+     lv_label_set_text(label, "LVGL OK\n踝康复平台");
+     lv_obj_center(label);
+  }
+  for (int i = 0; i < 10; i++) { lv_timer_handler(); HAL_Delay(20); }
 
   ecat_motion_run();   /* 扫从站 → CSV使能 → 伸出/缩回×5, 内部死循环, 不返回 */
   /* USER CODE END 2 */
