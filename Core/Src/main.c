@@ -23,6 +23,7 @@
 #include "lcd_fsmc.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
+#include "lv_port_indev.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -138,6 +139,7 @@ int main(void)
   lcd_init();
   lv_init();
   lv_port_disp_init();
+  lv_port_indev_init();
   {
      lv_obj_t *scr = lv_scr_act();
      lv_obj_t *label = lv_label_create(scr);

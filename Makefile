@@ -74,6 +74,8 @@ App/modbus_slave.c \
 App/sensor_wt.c \
 App/lcd_fsmc.c \
 App/lv_port_disp.c \
+App/lv_port_indev.c \
+App/touch_xpt2046.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \
