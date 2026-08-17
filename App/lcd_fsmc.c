@@ -3,10 +3,14 @@
  * (与本项目其余外设驱动风格一致: uart_log.c/modbus_slave.c 都是寄存器级直接访问)
  *
  * 面板初始化时序照抄《普中STM32-F407-战神开发板资料》官方tftlcd.c驱动源码里
- * TFTLCD_ILI9488 分支(命令码/参数逐条核对过), 只是把 StdPeriph 库调用换成本项目
- * 惯用的 HAL 寄存器级写法; FSMC总线时序未沿用官方数值(官方 FSMC_AddressHoldTime=
- * 0x15 超出ADDHLD寄存器位宽[3:0]最大0xF, 实际是靠溢出溢出到ADDSET位歪打正着能用,
- * 不适合照抄), 改用下方注释里推导的、在位宽范围内留足裕量的保守时序。
+ * TFTLCD_HX8357DN 分支(命令码/参数逐条核对过, 型号已由用户核对实物确认), 只是把
+ * StdPeriph 库调用换成本项目惯用的 HAL 寄存器级写法; FSMC总线时序未沿用官方数值
+ * (官方 FSMC_AddressHoldTime=0x15 超出ADDHLD寄存器位宽[3:0]最大0xF, 实际是靠溢出
+ * 溢出到ADDSET位歪打正着能用, 不适合照抄), 改用下方注释里推导的、在位宽范围内留
+ * 足裕量的保守时序。
+ *
+ * ILI9488分支(此前未确认型号前的试探性实现)仍保留在文件里但已不生效
+ * (LCD_PANEL_HX8357DN 已在 lcd_fsmc.h 里选定), 留作四种候选面板之一的参考。
  */
 #include "stm32f4xx_hal.h"
 #include "lcd_fsmc.h"
@@ -30,8 +34,8 @@ static inline void lcd_wr_cmd(uint16_t cmd)  { LCD_REG->CMD = cmd; }
 static inline void lcd_wr_data(uint16_t d)   { LCD_REG->DATA = d; }
 static inline void lcd_wr_cmd_data(uint16_t cmd, uint16_t d) { lcd_wr_cmd(cmd); lcd_wr_data(d); }
 
-#if defined(LCD_PANEL_ILI9488)
-/* ILI9488 内部按8位/次传输RGB565的两个字节(与官方驱动LCD_WriteData_Color一致) */
+#if defined(LCD_PANEL_HX8357DN) || defined(LCD_PANEL_ILI9488)
+/* HX8357DN/ILI9488 都是内部按8位/次传输RGB565的两个字节(与官方驱动LCD_WriteData_Color一致) */
 static inline void lcd_wr_color(uint16_t color)
 {
    LCD_REG->DATA = color >> 8;
@@ -103,7 +107,8 @@ static void lcd_fsmc_bus_init(void)
 /* ---- 窗口/GRAM 操作 ---- */
 static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-#if defined(LCD_PANEL_ILI9488)
+#if defined(LCD_PANEL_HX8357DN) || defined(LCD_PANEL_ILI9488)
+   /* HX8357DN与ILI9488的列/行地址设置+进GRAM写命令码一致(0x2A/0x2B/0x2C) */
    lcd_wr_cmd(0x2A);
    lcd_wr_data(x0 >> 8); lcd_wr_data(x0 & 0xFF);
    lcd_wr_data(x1 >> 8); lcd_wr_data(x1 & 0xFF);
@@ -116,8 +121,61 @@ static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 #endif
 }
 
+#if defined(LCD_PANEL_HX8357DN)
+/* HX8357DN初始化时序: 逐条照抄官方tftlcd.c的TFTLCD_HX8357DN分支(Gamma/电源/接口参数)。
+ * 官方驱动init里先写0x36=0x4c(其内部默认方向), 随后又在LCD_Display_Dir(1)里改写
+ * 0x36=0x2c+宽高对调成横屏480×320 —— 这里直接一步到位写成横屏最终态, 效果等价。 */
+static void lcd_panel_init_hx8357dn(void)
+{
+   lcd_wr_cmd_data(0xE9, 0x20);
+
+   lcd_wr_cmd(0x11);              /* Exit Sleep */
+   HAL_Delay(10);
+
+   lcd_wr_cmd_data(0x3A, 0x55);   /* 16bit colors */
+
+   lcd_wr_cmd(0xD1);
+   lcd_wr_data(0x00); lcd_wr_data(0x65); lcd_wr_data(0x1F);   /* VCOM电压/灰阶电压 */
+
+   lcd_wr_cmd(0xD0);
+   lcd_wr_data(0x07); lcd_wr_data(0x07); lcd_wr_data(0x80);
+
+   lcd_wr_cmd_data(0x36, 0x2C);   /* Set_address_mode: 横屏(取代官方init里的0x4c,
+                                      与官方LCD_Display_Dir(1)最终写入值一致) */
+   g_width = 480; g_height = 320;
+
+   lcd_wr_cmd(0xC1);
+   lcd_wr_data(0x10); lcd_wr_data(0x10); lcd_wr_data(0x02); lcd_wr_data(0x02);
+
+   lcd_wr_cmd(0xC0);              /* Set Default Gamma */
+   lcd_wr_data(0x00); lcd_wr_data(0x35); lcd_wr_data(0x00);
+   lcd_wr_data(0x00); lcd_wr_data(0x01); lcd_wr_data(0x02);
+
+   lcd_wr_cmd_data(0xC4, 0x03);
+
+   lcd_wr_cmd_data(0xC5, 0x01);   /* Set frame rate */
+
+   lcd_wr_cmd(0xD2);              /* power setting */
+   lcd_wr_data(0x01); lcd_wr_data(0x22);
+
+   lcd_wr_cmd_data(0xE7, 0x38);
+
+   lcd_wr_cmd(0xF3);
+   lcd_wr_data(0x08); lcd_wr_data(0x12); lcd_wr_data(0x12); lcd_wr_data(0x08);
+
+   lcd_wr_cmd(0xC8);              /* Set Gamma */
+   lcd_wr_data(0x01); lcd_wr_data(0x52); lcd_wr_data(0x37); lcd_wr_data(0x10);
+   lcd_wr_data(0x0D); lcd_wr_data(0x01); lcd_wr_data(0x04); lcd_wr_data(0x51);
+   lcd_wr_data(0x77); lcd_wr_data(0x01); lcd_wr_data(0x01); lcd_wr_data(0x0D);
+   lcd_wr_data(0x08); lcd_wr_data(0x80); lcd_wr_data(0x00);
+
+   lcd_wr_cmd(0x29);              /* Display ON */
+}
+#endif
+
 #if defined(LCD_PANEL_ILI9488)
-/* ILI9488初始化时序: 逐条照抄官方tftlcd.c的TFTLCD_ILI9488分支(Gamma/电源/接口参数) */
+/* ILI9488初始化时序(型号确认前的试探性实现, 现未启用, 留作参考): 逐条照抄官方
+ * tftlcd.c的TFTLCD_ILI9488分支(Gamma/电源/接口参数) */
 static void lcd_panel_init_ili9488(void)
 {
    lcd_wr_cmd(0xE0);  /* P-Gamma */
@@ -171,7 +229,9 @@ void lcd_init(void)
    lcd_fsmc_bus_init();
    HAL_Delay(50);
 
-#if defined(LCD_PANEL_ILI9488)
+#if defined(LCD_PANEL_HX8357DN)
+   lcd_panel_init_hx8357dn();
+#elif defined(LCD_PANEL_ILI9488)
    lcd_panel_init_ili9488();
 #endif
 
