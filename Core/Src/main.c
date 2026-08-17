@@ -20,6 +20,7 @@
 #include "main.h"
 #include "ecat_motion.h"
 #include "usb_device.h"
+#include "lcd_fsmc.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -127,6 +128,14 @@ int main(void)
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
   MX_USB_DEVICE_Init();   /* USB Slave(Micro-USB, PA11/PA12) 枚举成CDC虚拟串口 */
+
+  /* --- LCD点亮验证(阶段1): 只测总线+面板初始化+基本画图对不对, 三色竖条
+         验证RGB565通道顺序; 确认屏幕物理OK后这段测试图案会被开机动画取代。 --- */
+  lcd_init();
+  lcd_fill_rect(0,                 0, lcd_width()/3 - 1,     lcd_height() - 1, LCD_COLOR_RED);
+  lcd_fill_rect(lcd_width()/3,     0, lcd_width()*2/3 - 1,   lcd_height() - 1, LCD_COLOR_GREEN);
+  lcd_fill_rect(lcd_width()*2/3,   0, lcd_width() - 1,       lcd_height() - 1, LCD_COLOR_BLUE);
+
   ecat_motion_run();   /* 扫从站 → CSV使能 → 伸出/缩回×5, 内部死循环, 不返回 */
   /* USER CODE END 2 */
 
