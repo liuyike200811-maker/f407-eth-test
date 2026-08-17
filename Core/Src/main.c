@@ -24,6 +24,7 @@
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
+#include "lv_fonts.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -143,6 +144,7 @@ int main(void)
   {
      lv_obj_t *scr = lv_scr_act();
      lv_obj_t *label = lv_label_create(scr);
+     lv_obj_set_style_text_font(label, &lv_font_cn_20, 0);
      lv_label_set_text(label, "LVGL OK\n踝康复平台");
      lv_obj_center(label);
   }

@@ -76,6 +76,8 @@ App/lcd_fsmc.c \
 App/lv_port_disp.c \
 App/lv_port_indev.c \
 App/touch_xpt2046.c \
+App/lv_font_cn_14.c \
+App/lv_font_cn_20.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \
@@ -146,7 +148,8 @@ AS_DEFS =
 # C defines
 C_DEFS =  \
 -DUSE_HAL_DRIVER \
--DSTM32F407xx
+-DSTM32F407xx \
+-DLV_LVGL_H_INCLUDE_SIMPLE
 
 
 # AS includes
