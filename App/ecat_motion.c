@@ -21,6 +21,9 @@
  *
  * ⚠ 未做 DC 同步, 信捷 DS5C1 在 CSV 下自由运行(free-run)。实测单轴最大行程
  *   约159mm(见探测标定), 上升高度+运动幅度务必留余量; 建议每次运动前先 h 归零。
+ *
+ * 急停来源共3路, 同级别(谁先触发都直接置 g_abort=1): 串口'x'命令 / HMI线圈0x0006 /
+ * PB0+PB1物理按钮(常开+常闭双通道互相校验, 见 estop_pressed())。
  */
 #include "soem/soem.h"
 #include "ecat_motion.h"
@@ -411,13 +414,45 @@ static void sensor_status_tx(void)
    last_valid = v;
 }
 
-/* 非阻塞轮询命令通道: USART1(CH340)、USB Slave(虚拟串口)、Modbus/HMI(USART3) 三路并收。
-   每个通信周期调一次 —— 运动中也在调, 故急停/HMI命令运动中同样即时响应。 */
+/* ---- 物理急停按钮(双通道: 常开+常闭同时接, 互相校验, 2026-08新增) ----
+ * PB0=常开(NO)触点, PB1=常闭(NC)触点, 两路接线方式完全相同(内部上拉+另一端
+ * 接GND, 只是分别接按钮的NO/NC两个触点)。
+ *   没按: NO断开→PB0被上拉高电平; NC闭合→PB1被拉到GND低电平。
+ *   按下: NO闭合→PB0变低电平; NC断开→PB1被上拉变高电平。
+ * 正常情况下两路读数永远"互补"(一高一低); 只要有任一路示"已按下"——包括真按下,
+ * 以及只有一路因接触不良/断线而卡在"按下"读数——都触发急停, 不会因为单路接触
+ * 故障而悄悄失效(常开单独接线的方案没有这层交叉校验, 断线会被当成"没按")。*/
+#define ESTOP_NO_PORT  GPIOB
+#define ESTOP_NO_PIN   GPIO_PIN_0
+#define ESTOP_NC_PORT  GPIOB
+#define ESTOP_NC_PIN   GPIO_PIN_1
+
+static void estop_gpio_init(void)
+{
+   __HAL_RCC_GPIOB_CLK_ENABLE();
+   GPIO_InitTypeDef gi = {0};
+   gi.Pin  = ESTOP_NO_PIN | ESTOP_NC_PIN;
+   gi.Mode = GPIO_MODE_INPUT;
+   gi.Pull = GPIO_PULLUP;
+   HAL_GPIO_Init(GPIOB, &gi);
+}
+
+static int estop_pressed(void)
+{
+   int no_active = (HAL_GPIO_ReadPin(ESTOP_NO_PORT, ESTOP_NO_PIN) == GPIO_PIN_RESET);
+   int nc_active = (HAL_GPIO_ReadPin(ESTOP_NC_PORT, ESTOP_NC_PIN) == GPIO_PIN_SET);
+   return no_active || nc_active;
+}
+
+/* 非阻塞轮询命令通道: USART1(CH340)、USB Slave(虚拟串口)、Modbus/HMI(USART3)、
+   物理急停按钮 四路并收。每个通信周期调一次 —— 运动中也在调, 故急停/HMI命令
+   运动中同样即时响应。 */
 static void poll_cmd(void)
 {
    int ch;
    while ((ch = uart_rx_getc()) >= 0)  feed_cmd_byte((char)ch);
    while ((ch = usb_cdc_getc()) >= 0)  feed_cmd_byte((char)ch);
+   if (estop_pressed()) g_abort = 1;   /* 物理急停按钮: 和HMI线圈0x0006/串口'x'命令同级别, 共用g_abort */
    modbus_poll();            /* 收/解析/应答 Modbus 帧 */
    modbus_sync();            /* HMI 命令/参数 → 本地全局 */
    modbus_write_feedback();  /* 本地状态 → 反馈寄存器 */
@@ -1094,6 +1129,7 @@ void ecat_motion_run(void)
    uart_log_init();
    modbus_init();   /* USART3 上的 Modbus RTU 从站(HMI 用), 与串口命令并行 */
    sensor_init();   /* USART6 上的 WT901 姿态传感器接入(传感器跟随模式用) */
+   estop_gpio_init();   /* PB0/PB1 物理急停按钮(常开+常闭双通道) */
    uart_log("\r\n\r\n===== STM32 SOEM 康复运动 (CSV, 命令驱动) =====\r\n");
 
    uart_log("上次复位原因:");
