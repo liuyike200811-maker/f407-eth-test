@@ -46,6 +46,8 @@ typedef enum {
    LOGPH_EV_ESTOP,
    LOGPH_EV_SIGLOST,
    LOGPH_EV_HM_TO,
+   LOGPH_ST_NOLINK,     /* 未连接: EtherCAT扫不到网卡/从站时的降级心跳, 无时间戳+橙色 */
+   LOGPH_ST_SHUTDOWN,   /* 已下电: 收到下电退出命令后的终态心跳, 无时间戳+橙色 */
    LOGPH_COUNT
 } log_phrase_id_t;
 

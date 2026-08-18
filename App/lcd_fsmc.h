@@ -26,6 +26,8 @@ extern "C" {
 #define LCD_COLOR_BLACK      0x0000
 #define LCD_COLOR_GREEN      0x3E06   /* 终端绿, 不是纯饱和绿, 护眼一点 */
 #define LCD_COLOR_RED        0xF8A5   /* 稍微柔和的红, 跟绿在同一亮度量级 */
+#define LCD_COLOR_ORANGE     0xFD80   /* 琥珀橙, 用于"未连接/已下电"这类既非正常(绿)也非
+                                          报警(红)的第三态提示, 一眼跟前两者区分开 */
 
 /* 初始化FSMC总线+GPIO+面板上电时序, 上电后调一次。内部含背光开启+清黑屏。 */
 void lcd_init(void);

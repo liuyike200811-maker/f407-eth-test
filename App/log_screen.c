@@ -71,14 +71,27 @@ static void draw_timestamp(uint16_t x, uint16_t y, uint16_t fg)
    }
 }
 
+/* LOGPH_ST_NOLINK/LOGPH_ST_SHUTDOWN是"既非正常也非报警"的第三态提示(未连接EtherCAT/
+ * 已下电待安全断电), 按用户要求不带时间戳(这两种状态下"经过了多久"没有意义)、用橙色
+ * 跟绿(正常)/红(报警)区分开, 复用同一套"2秒心跳"节流机制, 只是画法特殊处理。*/
+static int is_third_state(log_phrase_id_t id)
+{
+   return id == LOGPH_ST_NOLINK || id == LOGPH_ST_SHUTDOWN;
+}
+
 static void draw_row(uint8_t row, log_phrase_id_t id, int is_err)
 {
    uint16_t y0 = (uint16_t)(row * ROW_H);
-   uint16_t fg = is_err ? LCD_COLOR_RED : LCD_COLOR_GREEN;
+   int third = is_third_state(id);
+   uint16_t fg = third ? LCD_COLOR_ORANGE : (is_err ? LCD_COLOR_RED : LCD_COLOR_GREEN);
+   uint16_t phrase_x = 4;
 
    lcd_fill_rect(0, y0, (uint16_t)(lcd_width() - 1), (uint16_t)(y0 + ROW_H - 1), LCD_COLOR_BLACK);
-   draw_timestamp(4, (uint16_t)(y0 + 4), fg);
-   draw_phrase((uint16_t)(4 + 8 * DIGIT_CELL_W + 8), (uint16_t)(y0 + 3), id, fg);
+   if (!third) {
+      draw_timestamp(4, (uint16_t)(y0 + 4), fg);
+      phrase_x = 4 + 8 * DIGIT_CELL_W + 8;
+   }
+   draw_phrase(phrase_x, (uint16_t)(y0 + 3), id, fg);
 }
 
 /* ============================================================ */

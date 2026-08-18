@@ -1005,8 +1005,9 @@ static void graceful_shutdown(void)
 {
    int i, sl;
    g_status = 5;   /* HMI 反馈: 已下电 */
+   log_screen_set_state(LOGPH_ST_SHUTDOWN);
    uart_log("下电: 脱力...\r\n");
-   for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); }
+   for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); log_screen_service(); }
    ctx.slavelist[0].state = EC_STATE_SAFE_OP;
    ecx_writestate(&ctx, 0);
    ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE * 4);
@@ -1024,6 +1025,7 @@ static void modbus_idle_loop(void)
 {
    g_status = 4;      /* 故障/未就绪(EtherCAT 未建立) */
    g_cur_mode = 99;
+   log_screen_set_state(LOGPH_ST_NOLINK);   /* 之前这条路径完全不碰屏幕, 屏上一直黑屏什么都不显示 */
    uart_log(">>> EtherCAT 未就绪, 进入 Modbus 降级空转(仍可被 HMI/电脑 连接单测) <<<\r\n");
    uart_log(">>> 本路已兼作传感器一手数据监视: 不接电缸时即在此打印 Roll/Pitch 与原始帧 <<<\r\n");
    sensor_reset();      /* 复位融合四元数+预热, 让 sensor_get 从头收敛 */
@@ -1043,6 +1045,7 @@ static void modbus_idle_loop(void)
       }
       poll_cmd();          /* modbus_poll/sync/feedback + USART1/USB 命令 */
       heartbeat();         /* 心跳灯照闪, 表明没死 */
+      log_screen_service(); /* 屏上橙色"未连接"每2秒心跳一次, 证明没死机(内部已节流) */
       osal_usleep(CYC_US); /* 无 EtherCAT, 相对延时凑 ~4ms 节拍即可 */
       if (++hb >= 250) {   /* 每约1秒播报一次融合角当前值+峰值+统计, 然后清零峰值 */
          hb = 0;
@@ -1192,7 +1195,9 @@ void ecat_motion_run(void)
       else if (g_run_request >= 0) { int m = g_run_request; g_run_request = -1; g_do_home = 0; run_rehab_mode(m); uart_log(">>> 回待机 <<<\r\n"); }
    }
 
-   /* 收到 q: 平滑下电退出 */
+   /* 收到 q: 平滑下电退出。之前这里下电完就彻底静默, 屏幕停留在下电前最后一帧不再刷新,
+      看起来像"卡住"——现在持续调 log_screen_service()(内部2秒节流), 屏上会一直
+      橙色心跳"已下电", 证明程序确实正常退出、不是真死机, 而不是画面冻结。 */
    graceful_shutdown();
-   while (1) { osal_usleep(100000); }
+   while (1) { log_screen_service(); osal_usleep(100000); }
 }
