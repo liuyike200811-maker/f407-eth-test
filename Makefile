@@ -78,6 +78,8 @@ App/lv_port_indev.c \
 App/touch_xpt2046.c \
 App/lv_font_cn_14.c \
 App/lv_font_cn_20.c \
+App/gui.c \
+App/gui_log.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \

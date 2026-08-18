@@ -28,6 +28,7 @@
 #include "usbd_cdc_if.h"
 #include "modbus_slave.h"
 #include "sensor_wt.h"
+#include "gui.h"
 #include "osal.h"
 #include "stm32f4xx_hal.h"   /* 心跳灯(GPIOF/PF9)直接寄存器访问用 */
 #include <string.h>
@@ -140,10 +141,10 @@ static volatile int g_quit        = 0;
 static volatile int g_abort       = 0;   /* 运动中急停标志 */
 
 /* HMI(Modbus 4x0010/4x0018)反馈用: 运行状态字 与 当前运行模式 */
-static volatile int g_status   = 0;      /* 0启动中 1待机 2运行 3归零 4故障 5已下电 */
+volatile int g_status   = 0;      /* 0启动中 1待机 2运行 3归零 4故障 5已下电 */
 static volatile int g_cur_mode = 99;     /* 0~4=正在跑的模式; 99=待机/无模式 */
 
-static volatile int g_wkc = 0;
+volatile int g_wkc = 0;
 
 /* ---- PDO 字节访问 (RxPDO: CW+mode+60FF; TxPDO: SW+mode+6063+606C) ---- */
 static inline void write_pdo(int sl, uint16_t cw, int32_t vel)
@@ -988,6 +989,8 @@ void ecat_motion_run(void)
    if (g_reset_cause & RCC_CSR_LPWRRSTF) uart_log(" 低功耗复位");
    uart_log("  (CSR=0x%08lX)\r\n", (unsigned long)g_reset_cause);
 
+   gui_boot_mcu_ok();   /* 屏显开机页: 走到这说明时钟/GPIO/串口都正常了 */
+
 #if SENSOR_STANDALONE_TEST
    sensor_standalone_test();   /* 不返回: 跳过下面所有EtherCAT初始化/电缸相关代码 */
 #endif
@@ -1003,6 +1006,7 @@ void ecat_motion_run(void)
       uart_log("[错误] 没扫到从站! 检查网线/伺服上电\r\n"); g_ec_phase = -2; ecx_close(&ctx); modbus_idle_loop();
    }
    g_ec_slavecount = ctx.slavecount;
+   gui_boot_bus_ok(ctx.slavecount);
    uart_log(">>> 扫到 %d 个从站 <<<\r\n", ctx.slavecount);
    for (sl = 1; sl <= ctx.slavecount; sl++) uart_log("    从站%d: %s\r\n", sl, ctx.slavelist[sl].name);
    if (ctx.slavecount < 1) { g_ec_phase = -2; ecx_close(&ctx); modbus_idle_loop(); }
@@ -1043,9 +1047,11 @@ void ecat_motion_run(void)
    for (sl = 1; sl <= ctx.slavecount; sl++)
       uart_log("    从站%d 状态字=0x%04X %s\r\n", sl, read_sw(sl),
                (read_sw(sl) & 0x0008) ? "[报警!]" : (((read_sw(sl) & 0x006F) == 0x0027) ? "[已使能]" : ""));
+   gui_boot_drv_enable();
 
    /* ===== 待机: 听命令 ===== */
    g_ec_phase = 99;
+   gui_boot_ready_and_show_home();   /* 屏显: 开机页收尾, 切到主页(旧开机页自动释放) */
    for (sl = 1; sl <= ctx.slavecount; sl++) start_pos[sl] = read_pos63(sl);  /* 反馈位置以此刻为0基准, 避免开机显示绝对编码值 */
    uart_log("\r\n>>> 进入待机, 伺服使能保持零速. 发 ? 查看命令. 建议先 h 归零 <<<\r\n");
    int hb = 0;
@@ -1056,6 +1062,12 @@ void ecat_motion_run(void)
       { float _r, _p; sensor_get(&_r, &_p); }   /* 待机也驱动校验计数,供 Bridge 诊断 */
       cycle();
       poll_cmd();
+
+      /* 屏显GUI: 只在待机循环里跑(不进run_rehab_mode/run_sensor_mode那些运动
+         闭环, 避免拖慢4ms节拍, 教训见代码导读"运动混乱"那条)。WKC正常判定
+         跟其余g_status逻辑一致口径: 无故障且WKC达到从站数×3才算真连上。 */
+      gui_set_ec_status(!g_ec_fault && g_wkc >= ctx.slavecount * 3, g_wkc, ctx.slavecount);
+      gui_service();
 
       if (++hb >= 250) {   /* 每约1秒播报, 终端实时监看 + Modbus 联调(看HMI请求到没到) */
          hb = 0;
