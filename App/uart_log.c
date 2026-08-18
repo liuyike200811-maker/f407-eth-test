@@ -9,7 +9,6 @@
 #include "stm32f4xx_hal.h"
 #include "uart_log.h"
 #include "usbd_cdc_if.h"
-#include "gui_log.h"
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -59,9 +58,6 @@ void uart_log(const char *fmt, ...)
    if (n < 0) return;
    if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
    for (i = 0; i < n; i++) uart_putc(buf[i]);
-
-   /* 屏幕"实时日志"页用: 纯内存拷贝进环形缓冲, 不阻塞, 不影响上面两路发送 */
-   gui_log_push(buf);
 
    /* USB CDC同步镜像一份: 非阻塞, 忙(上一包没发完)或没插USB线就直接丢,
       USART1(CH340)始终是权威通道, 这里丢了不影响功能, 只是那次没显示。 */
