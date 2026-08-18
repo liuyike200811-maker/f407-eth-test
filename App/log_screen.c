@@ -76,7 +76,7 @@ static void draw_timestamp(uint16_t x, uint16_t y, uint16_t fg)
  * 跟绿(正常)/红(报警)区分开, 复用同一套"2秒心跳"节流机制, 只是画法特殊处理。*/
 static int is_third_state(log_phrase_id_t id)
 {
-   return id == LOGPH_ST_NOLINK || id == LOGPH_ST_SHUTDOWN;
+   return id == LOGPH_ST_NOLINK;
 }
 
 static void draw_row(uint8_t row, log_phrase_id_t id, int is_err)

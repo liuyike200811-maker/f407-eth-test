@@ -1005,7 +1005,7 @@ static void graceful_shutdown(void)
 {
    int i, sl;
    g_status = 5;   /* HMI 反馈: 已下电 */
-   log_screen_set_state(LOGPH_ST_SHUTDOWN);
+   log_screen_set_state(LOGPH_ST_NOLINK);   /* 下电后复用"未连接"这条(不单独做一条"已下电"), 视觉上更统一 */
    uart_log("下电: 脱力...\r\n");
    for (i = 0; i < 200; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x0006, 0); cycle(); log_screen_service(); }
    ctx.slavelist[0].state = EC_STATE_SAFE_OP;
@@ -1197,7 +1197,8 @@ void ecat_motion_run(void)
 
    /* 收到 q: 平滑下电退出。之前这里下电完就彻底静默, 屏幕停留在下电前最后一帧不再刷新,
       看起来像"卡住"——现在持续调 log_screen_service()(内部2秒节流), 屏上会一直
-      橙色心跳"已下电", 证明程序确实正常退出、不是真死机, 而不是画面冻结。 */
+      橙色心跳"未连接"(复用同一条, 不单独做"已下电"), 证明程序确实正常退出、
+      不是真死机, 而不是画面冻结。 */
    graceful_shutdown();
    while (1) { log_screen_service(); osal_usleep(100000); }
 }
