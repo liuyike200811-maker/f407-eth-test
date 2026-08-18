@@ -72,6 +72,10 @@ App/ecat_motion.c \
 App/uart_log.c \
 App/modbus_slave.c \
 App/sensor_wt.c \
+App/lcd_fsmc.c \
+App/log_screen.c \
+App/log_phrases_data.c \
+App/digit_font_data.c \
 App/usb_device.c \
 App/usbd_conf.c \
 App/usbd_desc.c \

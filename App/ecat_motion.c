@@ -28,6 +28,7 @@
 #include "usbd_cdc_if.h"
 #include "modbus_slave.h"
 #include "sensor_wt.h"
+#include "log_screen.h"
 #include "osal.h"
 #include "stm32f4xx_hal.h"   /* 心跳灯(GPIOF/PF9)直接寄存器访问用 */
 #include <string.h>
@@ -166,6 +167,37 @@ static int any_fault(void)
    for (int sl = 1; sl <= ctx.slavecount; sl++)
       if (read_sw(sl) & 0x0008) return sl;
    return 0;
+}
+
+/* mode(0~4) → 屏显日志短语id, 給log_screen_event()用 */
+static log_phrase_id_t mode_start_phrase(int mode)
+{
+   switch (mode) {
+      case 0:  return LOGPH_EV_M0_START;
+      case 1:  return LOGPH_EV_M1_START;
+      case 2:  return LOGPH_EV_M2_START;
+      case 3:  return LOGPH_EV_M3_START;
+      default: return LOGPH_EV_M4_START;
+   }
+}
+static log_phrase_id_t mode_done_phrase(int mode)
+{
+   switch (mode) {
+      case 0:  return LOGPH_EV_M0_DONE;
+      case 1:  return LOGPH_EV_M1_DONE;
+      case 2:  return LOGPH_EV_M2_DONE;
+      case 3:  return LOGPH_EV_M3_DONE;
+      default: return LOGPH_EV_M4_DONE;
+   }
+}
+/* 从站号(1~3) → 报警短语id; EC_MAXSLAVE虽然是16, 但实际只装了3个伺服 */
+static log_phrase_id_t slave_fault_phrase(int slave)
+{
+   switch (slave) {
+      case 1:  return LOGPH_EV_SLV1;
+      case 2:  return LOGPH_EV_SLV2;
+      default: return LOGPH_EV_SLV3;
+   }
 }
 
 /* 心跳灯: LED0=PF9 低电平点亮. 每约500ms翻转一次(4ms节拍 * 125次).
@@ -507,6 +539,7 @@ static int move_ramp(double raise_vel, int cruise_frames)
       double vff = raise_vel * i / RAMP_FRAMES;
       for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, vff));
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); return -1; }
       if (g_abort) return -2;
    }
@@ -514,6 +547,7 @@ static int move_ramp(double raise_vel, int cruise_frames)
    for (i = 0; i < cruise_frames; i++) {
       for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, raise_vel));
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); return -1; }
       if (g_abort) return -2;
    }
@@ -522,6 +556,7 @@ static int move_ramp(double raise_vel, int cruise_frames)
       double vff = raise_vel * (RAMP_FRAMES - i) / RAMP_FRAMES;
       for (int sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, vff));
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); return -1; }
       if (g_abort) return -2;
    }
@@ -543,14 +578,17 @@ static int run_rehab_mode(int mode)
    if (cruise_frames < 1) cruise_frames = 1;
 
    uart_log(">>> 模式%d 开始: 上升%dmm@%dRPM → 运动 → 下降 <<<\r\n", mode, g_rise_mm, g_rise_rpm);
+   log_screen_event(mode_start_phrase(mode), 0);
 
    /* 阶段1: 上升 */
+   log_screen_set_state(LOGPH_ST_RISE);
    rc = move_ramp((double)raise_vel, cruise_frames);
    if (rc < 0) goto stopmsg;
-   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); log_screen_service(); }
    uart_log("  上升完成, 方向锁定: 轴1=%+d 轴2=%+d 轴3=%+d\r\n", fb_sign[1], fb_sign[2], fb_sign[3]);
 
    /* 阶段2: 运动 */
+   log_screen_set_state(LOGPH_ST_RUN);
    if (mode == 0) {
       /* 综合波浪(电缸空间三轴相位差) */
       int32_t wave_amp = (int32_t)((double)g_wave_mm * PULSE_PER_REV / LEAD_MM);
@@ -566,6 +604,7 @@ static int run_rehab_mode(int mode)
             write_pdo(sl, 0x000F, vel_closed(sl, vff));
          }
          cycle(); poll_cmd();
+         log_screen_service();   /* 内部2秒节流+每次最多画一行, 跟uart_log那种无节流阻塞是两回事, 可以放这里 */
          if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
          if (g_abort) { rc = -2; goto stopmsg; }
          /* 运动中绝不打印: uart_log 是阻塞式串口发送(每字符忙等~87us, 一行~4ms),
@@ -600,6 +639,7 @@ static int run_rehab_mode(int mode)
             write_pdo(sl, 0x000F, vel_closed(sl, vff));
          }
          cycle(); poll_cmd();
+         log_screen_service();
          if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
          if (g_abort) { rc = -2; goto stopmsg; }
          /* 运动中绝不打印(同上, 避免 uart_log 阻塞撑破 4ms 节拍) */
@@ -607,13 +647,15 @@ static int run_rehab_mode(int mode)
    }
 
    /* 阶段3: 下降回原点 */
-   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
+   log_screen_set_state(LOGPH_ST_FALL);
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); log_screen_service(); }
    rc = move_ramp(-(double)raise_vel, cruise_frames);
    if (rc < 0) goto stopmsg;
    /* 末端主动闭环回精确原点 */
    for (i = 0; i < 150; i++) {
       for (sl = 1; sl <= ctx.slavecount; sl++) { cmd_pos[sl] = 0.0; write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); }
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
       if (g_abort) { rc = -2; goto stopmsg; }
    }
@@ -622,11 +664,20 @@ static int run_rehab_mode(int mode)
             (read_pos63(1) - start_pos[1]) * MM_PER_PULSE,
             (read_pos63(2) - start_pos[2]) * MM_PER_PULSE,
             (read_pos63(3) - start_pos[3]) * MM_PER_PULSE);
+   log_screen_event(mode_done_phrase(mode), 0);
+   log_screen_set_state(LOGPH_ST_IDLE);
    return 0;
 
 stopmsg:
-   if (rc == -2) uart_log("!! 急停, 平滑降速回待机\r\n");
-   else          uart_log("!! 从站%d 报警, 平滑降速回待机\r\n", g_ec_fault);
+   if (rc == -2) {
+      uart_log("!! 急停, 平滑降速回待机\r\n");
+      log_screen_event(LOGPH_EV_ESTOP, 1);
+      log_screen_set_state(LOGPH_ST_IDLE);
+   } else {
+      uart_log("!! 从站%d 报警, 平滑降速回待机\r\n", g_ec_fault);
+      log_screen_event(slave_fault_phrase(g_ec_fault), 1);
+      log_screen_set_state(LOGPH_ST_FAULT);
+   }
    ramp_to_zero();
    return rc;
 }
@@ -692,16 +743,19 @@ static int run_sensor_mode(void)
    fk_3rps(0.0, 0.0, z_eff, l_prev);   /* 基线=标定姿态(零倾斜), 提前初始化防 goto 跳过 */
 
    uart_log(">>> 传感器跟随: 上升%dmm → 零偏标定 → 实时跟随(发 x 退出) <<<\r\n", g_rise_mm);
+   log_screen_event(LOGPH_EV_SF_START, 0);
 
    /* 阶段1: 上升到工作高度(与其它模式一致) */
+   log_screen_set_state(LOGPH_ST_RISE);
    rc = move_ramp((double)raise_vel, cruise_frames);
    if (rc < 0) goto stopmsg;
-   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); log_screen_service(); }
    uart_log("  上升完成, 方向锁定: 轴1=%+d 轴2=%+d 轴3=%+d\r\n", fb_sign[1], fb_sign[2], fb_sign[3]);
 
    /* 阶段2: 零偏标定 —— 平台不动, 采集足够多【有效帧】求均值+离散度
     * (解析层前几帧在锁源观测, 会返回0, 所以按"有效帧数"而非"控制帧数"计, 且给足超时) */
    uart_log("  标定中(请把脚踝放到中位并保持不动)...\r\n");
+   log_screen_event(LOGPH_EV_CAL_ING, 0);
    double sum_r = 0.0, sum_p = 0.0, sum_r2 = 0.0, sum_p2 = 0.0; int ncal = 0;
    for (i = 0; i < SENSOR_CAL_MAX_FRAMES && ncal < SENSOR_CAL_MIN_SAMPLES; i++) {
       if (sensor_get(&r, &p)) {
@@ -710,12 +764,14 @@ static int run_sensor_mode(void)
       }
       for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0));
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
       if (g_abort)     { rc = -2; goto stopmsg; }
    }
    if (ncal < SENSOR_CAL_MIN_SAMPLES) {   /* 有效帧不够 → 链路没通/数据全被校验丢弃, 安全退出 */
       uart_log("!! 标定失败: 仅%d/%d 有效帧, 检查USART6(PC7)/转发/波特率/传感器. 退出.\r\n",
                ncal, SENSOR_CAL_MIN_SAMPLES);
+      log_screen_event(LOGPH_EV_CAL_FAIL, 1);
       rc = -2; goto stopmsg;
    }
    double roll0 = sum_r / ncal, pitch0 = sum_p / ncal;
@@ -725,10 +781,13 @@ static int run_sensor_mode(void)
    if (sd_r > SENSOR_CAL_MAX_STDDEV || sd_p > SENSOR_CAL_MAX_STDDEV) {   /* 没放稳/数据跳→零点不可信 */
       uart_log("!! 标定失败: 数据不稳(σR=%.2f σP=%.2f°>%.1f), 请放稳后重试. 退出.\r\n",
                sd_r, sd_p, SENSOR_CAL_MAX_STDDEV);
+      log_screen_event(LOGPH_EV_CAL_FAIL, 1);
       rc = -2; goto stopmsg;
    }
    uart_log("  标定完成(%d帧): Roll0=%.2f° Pitch0=%.2f° σ(%.2f,%.2f) 源=6轴融合. 开始跟随.\r\n",
             ncal, roll0, pitch0, sd_r, sd_p);
+   log_screen_event(LOGPH_EV_CAL_OK, 0);
+   log_screen_set_state(LOGPH_ST_RUN);
 
    /* 阶段3: 实时跟随
     * want_a/want_b 只在收到有效帧时刷新(经符号/增益/限幅/死区), 帧间 ZOH 保持;
@@ -752,8 +811,10 @@ static int run_sensor_mode(void)
          /* 无新帧: 分档处理。>2s 判链路真断, 设定缓慢归平到水平(最安全); 否则冻结保持。 */
          if (lost < SENSOR_NEUTRAL_FRAMES) lost++;
          if (lost >= SENSOR_NEUTRAL_FRAMES) { want_a = 0.0; want_b = 0.0; }
-         else if (lost == SENSOR_WATCHDOG_FRAMES)
+         else if (lost == SENSOR_WATCHDOG_FRAMES) {
             uart_log("  [看门狗] 信号丢失>300ms, 冻结保持姿态\r\n");
+            log_screen_event(LOGPH_EV_SIGLOST, 1);
+         }
       }
 
       /* One-Euro 自适应滤波(内含角速度硬限幅) → 平台目标角 */
@@ -769,6 +830,7 @@ static int run_sensor_mode(void)
          l_prev[sl - 1] = l_now[sl - 1];
       }
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); rc = -1; goto stopmsg; }
       if (g_abort)     { rc = -2; goto stopmsg; }   /* x = 退出跟随 */
    }
@@ -776,11 +838,14 @@ static int run_sensor_mode(void)
 stopmsg:
    if (rc == -1) {   /* 从站报警: 不再主动移动, 就地降速回待机 */
       uart_log("!! 从站%d 报警, 平滑降速回待机\r\n", g_ec_fault);
+      log_screen_event(slave_fault_phrase(g_ec_fault), 1);
+      log_screen_set_state(LOGPH_ST_FAULT);
       ramp_to_zero();
       return rc;
    }
    /* rc==-2(用户 x 退出 / 标定失败): 先把平台归平, 再下降回原点 */
    uart_log("!! 退出跟随: 归平 → 下降回原点\r\n");
+   log_screen_set_state(LOGPH_ST_FALL);
    g_abort = 0;                       /* 清急停, 让后续下降动作能执行 */
    for (i = 0; i < 400; i++) {        /* 目标角指数衰减到 0, 平滑归平 */
       ta *= 0.98; tb *= 0.98;
@@ -792,18 +857,22 @@ stopmsg:
          l_prev[sl - 1] = l_now[sl - 1];
       }
       cycle(); poll_cmd();
+      log_screen_service();
       if (any_fault()) { g_ec_fault = any_fault(); ramp_to_zero(); return -1; }
    }
-   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); }
+   for (i = 0; i < 100; i++) { for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); cycle(); poll_cmd(); log_screen_service(); }
    move_ramp(-(double)raise_vel, cruise_frames);
    for (i = 0; i < 150; i++) {        /* 末端主动闭环回精确原点 */
       for (sl = 1; sl <= ctx.slavecount; sl++) { cmd_pos[sl] = 0.0; write_pdo(sl, 0x000F, vel_closed(sl, 0.0)); }
       cycle(); poll_cmd();
+      log_screen_service();
    }
    uart_log(">>> 跟随结束, 残余误差: 轴1=%.2fmm 轴2=%.2fmm 轴3=%.2fmm <<<\r\n",
             (read_pos63(1) - start_pos[1]) * MM_PER_PULSE,
             (read_pos63(2) - start_pos[2]) * MM_PER_PULSE,
             (read_pos63(3) - start_pos[3]) * MM_PER_PULSE);
+   log_screen_event(LOGPH_EV_SF_DONE, 0);
+   log_screen_set_state(LOGPH_ST_IDLE);
    return rc;
 }
 
@@ -818,6 +887,8 @@ static void run_homing(void)
    g_status = 3; g_cur_mode = 99;   /* HMI 反馈: 归零中 */
 
    uart_log(">>> 归零: 三轴收缩@%dpulse/s, 堵转自停 <<<\r\n", RETRACT_VEL);
+   log_screen_event(LOGPH_EV_HM_START, 0);
+   log_screen_set_state(LOGPH_ST_HOMING);
    for (sl = 1; sl <= ctx.slavecount; sl++) vel_cmd[sl] = RETRACT_VEL;
 
    /* 缓慢加速到收缩速度 */
@@ -825,7 +896,12 @@ static void run_homing(void)
       int32_t v = (int32_t)((int64_t)RETRACT_VEL * i / 100);
       for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, v);
       cycle(); poll_cmd();
-      if (g_abort) { ramp_to_zero(); uart_log("!! 归零急停\r\n"); return; }
+      log_screen_service();
+      if (g_abort) {
+         ramp_to_zero(); uart_log("!! 归零急停\r\n");
+         log_screen_event(LOGPH_EV_ESTOP, 1); log_screen_set_state(LOGPH_ST_IDLE);
+         return;
+      }
    }
 
    for (sl = 1; sl <= ctx.slavecount; sl++) pos_win[sl] = read_pos63(sl);   /* 检测起点 */
@@ -848,13 +924,24 @@ static void run_homing(void)
       }
       for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, vel_cmd[sl]);
       cycle(); poll_cmd();
-      if (g_abort) { ramp_to_zero(); uart_log("!! 归零急停\r\n"); return; }
+      log_screen_service();
+      if (g_abort) {
+         ramp_to_zero(); uart_log("!! 归零急停\r\n");
+         log_screen_event(LOGPH_EV_ESTOP, 1); log_screen_set_state(LOGPH_ST_IDLE);
+         return;
+      }
 
       int all = 1;
       for (sl = 1; sl <= ctx.slavecount; sl++) if (!stopped[sl]) all = 0;
-      if (all) { uart_log(">>> 归零完成, 所有轴到位 <<<\r\n"); return; }
+      if (all) {
+         uart_log(">>> 归零完成, 所有轴到位 <<<\r\n");
+         log_screen_event(LOGPH_EV_HM_DONE, 0); log_screen_set_state(LOGPH_ST_IDLE);
+         return;
+      }
    }
    uart_log(">>> 归零超时(部分轴未检测到限位) <<<\r\n");
+   log_screen_event(LOGPH_EV_HM_TO, 1);
+   log_screen_set_state(LOGPH_ST_IDLE);
    ramp_to_zero();
 }
 
@@ -992,6 +1079,7 @@ void ecat_motion_run(void)
    sensor_standalone_test();   /* 不返回: 跳过下面所有EtherCAT初始化/电缸相关代码 */
 #endif
 
+   log_screen_set_state(LOGPH_ST_BOOT);
    g_ec_phase = 1;
    if (!ecx_init(&ctx, "stm32eth")) {
       uart_log("[错误] 网卡初始化失败\r\n"); g_ec_phase = -1; modbus_idle_loop();
@@ -1003,6 +1091,9 @@ void ecat_motion_run(void)
       uart_log("[错误] 没扫到从站! 检查网线/伺服上电\r\n"); g_ec_phase = -2; ecx_close(&ctx); modbus_idle_loop();
    }
    g_ec_slavecount = ctx.slavecount;
+   log_screen_event(ctx.slavecount >= 3 ? LOGPH_EV_SCAN3 :
+                     ctx.slavecount == 2 ? LOGPH_EV_SCAN2 :
+                     ctx.slavecount == 1 ? LOGPH_EV_SCAN1 : LOGPH_EV_SCAN0, 0);
    uart_log(">>> 扫到 %d 个从站 <<<\r\n", ctx.slavecount);
    for (sl = 1; sl <= ctx.slavecount; sl++) uart_log("    从站%d: %s\r\n", sl, ctx.slavelist[sl].name);
    if (ctx.slavecount < 1) { g_ec_phase = -2; ecx_close(&ctx); modbus_idle_loop(); }
@@ -1033,6 +1124,7 @@ void ecat_motion_run(void)
       cycle();
    }
    ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+   log_screen_event(LOGPH_EV_BUS_OK, 0);
    uart_log("OP 建立, WKC=%d (正常≈%d)\r\n", g_wkc, ctx.slavecount * 3);
 
    /* CiA402 使能: 0x06 → 0x07 → 0x0F */
@@ -1043,9 +1135,11 @@ void ecat_motion_run(void)
    for (sl = 1; sl <= ctx.slavecount; sl++)
       uart_log("    从站%d 状态字=0x%04X %s\r\n", sl, read_sw(sl),
                (read_sw(sl) & 0x0008) ? "[报警!]" : (((read_sw(sl) & 0x006F) == 0x0027) ? "[已使能]" : ""));
+   log_screen_event(LOGPH_EV_DRV_OK, 0);
 
    /* ===== 待机: 听命令 ===== */
    g_ec_phase = 99;
+   log_screen_set_state(LOGPH_ST_IDLE);
    for (sl = 1; sl <= ctx.slavecount; sl++) start_pos[sl] = read_pos63(sl);  /* 反馈位置以此刻为0基准, 避免开机显示绝对编码值 */
    uart_log("\r\n>>> 进入待机, 伺服使能保持零速. 发 ? 查看命令. 建议先 h 归零 <<<\r\n");
    int hb = 0;
@@ -1056,6 +1150,7 @@ void ecat_motion_run(void)
       { float _r, _p; sensor_get(&_r, &_p); }   /* 待机也驱动校验计数,供 Bridge 诊断 */
       cycle();
       poll_cmd();
+      log_screen_service();   /* 屏显日志(内部2秒节流), 待机中每2秒心跳一次证明没死机 */
 
       if (++hb >= 250) {   /* 每约1秒播报, 终端实时监看 + Modbus 联调(看HMI请求到没到) */
          hb = 0;

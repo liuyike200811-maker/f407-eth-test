@@ -20,6 +20,7 @@
 #include "main.h"
 #include "ecat_motion.h"
 #include "usb_device.h"
+#include "log_screen.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -127,6 +128,7 @@ int main(void)
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
   MX_USB_DEVICE_Init();   /* USB Slave(Micro-USB, PA11/PA12) 枚举成CDC虚拟串口 */
+  log_screen_init();   /* 板载3.5寸屏点亮, 纯日志展示(不做控制/触摸) */
   ecat_motion_run();   /* 扫从站 → CSV使能 → 伸出/缩回×5, 内部死循环, 不返回 */
   /* USER CODE END 2 */
 
