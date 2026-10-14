@@ -17,6 +17,7 @@ uint8_t CDC_Transmit_FS(uint8_t *Buf, uint16_t Len);
 
 /* 非阻塞收一个字节: 有数据返回0~255, 无数据返回-1 */
 int usb_cdc_getc(void);
+int usb_cdc_tx_ready(void);
 
 #ifdef __cplusplus
 }

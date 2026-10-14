@@ -75,3 +75,9 @@ uint8_t CDC_Transmit_FS(uint8_t *Buf, uint16_t Len)
    USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
    return USBD_CDC_TransmitPacket(&hUsbDeviceFS);
 }
+
+int usb_cdc_tx_ready(void)
+{
+   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+   return hUsbDeviceFS.dev_state==USBD_STATE_CONFIGURED && hcdc && !hcdc->TxState;
+}

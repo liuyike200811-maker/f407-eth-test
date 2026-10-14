@@ -24,7 +24,7 @@ extern "C" {
 
 #define MODBUS_SLAVE_ID    1
 #define MODBUS_NUM_COILS   16    /* 用到 0..8, 留余量 */
-#define MODBUS_NUM_HREGS   25    /* 用到 0..24 (契约 v2: 含 4x0018) */
+#define MODBUS_NUM_HREGS   26    /* 用到 0..24 (契约 v2: 含 4x0018) */
 
 /* 寄存器区(地址基数0, 下标=Modbus地址号)。仅主上下文读写;
    ISR 只碰内部 RX 缓冲, 不碰这两个数组, 故无需临界区。 */

@@ -36,6 +36,7 @@
 #include "stm32f4xx_hal.h"   /* 心跳灯(GPIOF/PF9)直接寄存器访问用 */
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 volatile int g_ec_slavecount = 0;
 volatile int g_ec_phase = 0;
@@ -161,6 +162,71 @@ static volatile int g_cur_mode = 99;     /* 0~4=正在跑的模式; 99=待机/�
 
 static volatile int g_wkc = 0;
 
+/* 外部目标模式7：单次绝对定位；机械零点只在成功归零时有效。 */
+static int32_t home_pos[EC_MAXSLAVE];
+static int home_valid = 0;
+static int g_do_virtual = 0;
+static uint32_t vt_epoch = 0, vt_seq = 0, vt_link_tick = 0;
+static float vt_target[3];
+static int vt_have_target = 0, vt_detail = 0, vt_report_pending = 1, vt_accepting = 0;
+#define VT_MAX_MM 130.0
+#define VT_LINK_MS (SENSOR_NEUTRAL_FRAMES * CYC_US / 1000)
+
+static int vt_hex(char c)
+{
+   if (c >= '0' && c <= '9') return c - '0';
+   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+   return -1;
+}
+static uint16_t vt_crc(const uint8_t *p, int n)
+{
+   uint16_t crc = 0xFFFF;
+   while (n--) { crc ^= *p++; for (int j=0;j<8;j++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1; }
+   return crc;
+}
+/* @T + epoch(8hex) + 29B payload(58hex) + CRC16(4hex), CRC covers epoch LE + payload. */
+static void vt_command(const char *line)
+{
+   if (!strcmp(line, "@?")) { vt_report_pending = 1; return; }
+   size_t len = strlen(line);
+   if (len != 10 && len != 72) { vt_detail = 6; vt_report_pending = 1; return; }
+   uint32_t epoch=0;
+   for (int i=2;i<10;i++) { int h=vt_hex(line[i]); if(h<0) return; epoch=(epoch<<4)|(uint32_t)h; }
+   if (!vt_accepting || g_cur_mode != 7 || epoch != vt_epoch) { vt_report_pending=1; return; }
+   if (line[1]=='P' && len==10) { vt_link_tick=HAL_GetTick(); return; }
+   if (line[1]=='X' && len==10) { g_abort=1; vt_report_pending=1; return; }
+   if (line[1]!='T' || len!=72) { vt_detail=6; vt_report_pending=1; return; }
+   uint8_t bytes[33]; memcpy(bytes,&epoch,4);
+   for(int i=0;i<29;i++) {
+      int a=vt_hex(line[10+2*i]), b=vt_hex(line[11+2*i]);
+      if(a<0 || b<0) { vt_detail=6; vt_report_pending=1; return; }
+      bytes[4+i]=(uint8_t)((a<<4)|b);
+   }
+   uint16_t crc=0;
+   for(int i=68;i<72;i++) { int h=vt_hex(line[i]); if(h<0) return; crc=(uint16_t)((crc<<4)|h); }
+   float targets[3]; memcpy(targets,bytes+9,12);
+   if(crc!=vt_crc(bytes,33)) { vt_detail=6; vt_report_pending=1; return; }
+   for(int i=0;i<3;i++) if(!isfinite(targets[i]) || targets[i]<0.0f || targets[i]>VT_MAX_MM) {
+      vt_detail=6; vt_report_pending=1; return;
+   }
+   int changed = !vt_have_target || memcmp(vt_target,targets,sizeof targets)!=0;
+   memcpy(&vt_seq,bytes+4,4);
+   memcpy(vt_target,targets,sizeof targets); vt_have_target=1;
+   vt_link_tick=HAL_GetTick(); if(changed) vt_detail=2; vt_report_pending=1;
+}
+static void vt_report(void)
+{
+   static char tx[96]; static uint32_t last=0;
+   uint32_t now=HAL_GetTick();
+   if ((!vt_report_pending && now-last<500) || !usb_cdc_tx_ready()) return;
+   int n=snprintf(tx,sizeof tx,"VT1 %lu %d %d %lu %d\r\n",(unsigned long)vt_epoch,
+      vt_accepting,vt_detail,(unsigned long)vt_seq,home_valid);
+   if(n>0 && CDC_Transmit_FS((uint8_t *)tx,(uint16_t)n)==USBD_OK) {
+      vt_report_pending=0; last=now;
+   }
+}
+
 /* ---- PDO 字节访问 (RxPDO: CW+mode+60FF; TxPDO: SW+mode+6063+606C) ---- */
 static inline void write_pdo(int sl, uint16_t cw, int32_t vel)
 {
@@ -252,6 +318,8 @@ static void cycle(void)
 /* 累积一行(\r或\n结束)后分派。行首字母=命令, 其余为可选整数参数。 */
 static void handle_cmd(char *line)
 {
+   if (line[0] == '@') { vt_command(line); return; }
+   if (g_cur_mode == 7 && line[0] != 'x' && line[0] != 'q' && line[0] != '?') return;
    char c = line[0];
    int  arg = 0, has = 0;
    for (char *p = line + 1; *p; p++) {
@@ -284,16 +352,15 @@ static void handle_cmd(char *line)
 }
 
 /* 把一个字节喂进行缓冲区, 攒够一行(\r或\n)就解析。USART1/USB两路共用同一份逻辑。 */
-static void feed_cmd_byte(char ch)
+static void feed_cmd_byte(char ch, int channel)
 {
-   static char buf[32];
-   static int  len = 0;
-   if (ch == '\r' || ch == '\n') {
-      if (len > 0) { buf[len] = '\0'; handle_cmd(buf); len = 0; }
-   } else if (len < (int)sizeof(buf) - 1) {
-      buf[len++] = ch;
-   } else {
-      len = 0;   /* 溢出丢弃 */
+   static char buf[2][96]; static int len[2], discard[2];
+   if(ch=='\r' || ch=='\n') {
+      if(!discard[channel] && len[channel]>0) { buf[channel][len[channel]]=0; handle_cmd(buf[channel]); }
+      len[channel]=0; discard[channel]=0;
+   } else if(!discard[channel]) {
+      if(len[channel] < 95) buf[channel][len[channel]++]=ch;
+      else { discard[channel]=1; len[channel]=0; }
    }
 }
 
@@ -333,13 +400,15 @@ static void modbus_sync(void)
       int req = -1;
       for (int m = 0; m < 5; m++)
          if (modbus_coils[m]) { if (req < 0) req = m; modbus_coils[m] = 0; }  /* 多个同ON以先到为准 */
+      int virtual_req = modbus_coils[10]; modbus_coils[10] = 0;
       int sensor_req = modbus_coils[9]; modbus_coils[9] = 0;                  /* 0x0009 传感器跟随 */
       if (modbus_coils[5])   { modbus_coils[5] = 0; g_do_home = 1; }          /* 归零优先 */
+      else if (virtual_req) { g_do_virtual = 1; }
       else if (sensor_req)   { g_do_sensor = 1; }
       else if (req >= 0)     { g_run_request = req; }
    } else {
       for (int m = 0; m <= 5; m++) modbus_coils[m] = 0;
-      modbus_coils[9] = 0;
+      modbus_coils[9] = 0; modbus_coils[10] = 0;
    }
 }
 
@@ -347,9 +416,9 @@ static void modbus_sync(void)
 static void modbus_write_feedback(void)
 {
    static uint16_t hb = 0;
-   int32_t p1 = (ctx.slavecount >= 1) ? (read_pos63(1) - start_pos[1]) : 0;
-   int32_t p2 = (ctx.slavecount >= 2) ? (read_pos63(2) - start_pos[2]) : 0;
-   int32_t p3 = (ctx.slavecount >= 3) ? (read_pos63(3) - start_pos[3]) : 0;
+   int32_t p1 = (ctx.slavecount >= 1) ? (read_pos63(1) - (home_valid ? home_pos[1] : start_pos[1])) : 0;
+   int32_t p2 = (ctx.slavecount >= 2) ? (read_pos63(2) - (home_valid ? home_pos[2] : start_pos[2])) : 0;
+   int32_t p3 = (ctx.slavecount >= 3) ? (read_pos63(3) - (home_valid ? home_pos[3] : start_pos[3])) : 0;
 
    modbus_hreg[16] = (uint16_t)g_status;                    /* 运行状态字 */
    modbus_hreg[17] = (uint16_t)g_ec_fault;                  /* 故障从站号 */
@@ -359,6 +428,7 @@ static void modbus_write_feedback(void)
    modbus_hreg[21] = (uint16_t)(int16_t)(p2 * MM_PER_PULSE * 10.0);  /* 轴2 */
    modbus_hreg[22] = (uint16_t)(int16_t)(p3 * MM_PER_PULSE * 10.0);  /* 轴3 */
    modbus_hreg[23] = ++hb;                                  /* 心跳(溢出自然归零) */
+   modbus_hreg[25] = (uint16_t)vt_detail;
    modbus_hreg[24] = (uint16_t)g_cur_mode;                  /* 当前运行模式 */
 }
 
@@ -382,17 +452,18 @@ static void modbus_write_feedback(void)
 static void twin_emit(void)
 {
    static uint32_t seq = 0;
-   uint8_t buf[32];
+   static uint8_t buf[32];
    float pos[3], vel[3];
+   seq++;
+   if (!usb_cdc_tx_ready()) return;
 
    for (int sl = 1; sl <= 3; sl++) {
-      int32_t dp = (ctx.slavecount >= sl) ? (read_pos63(sl) - start_pos[sl]) : 0;
+      int32_t dp = (ctx.slavecount >= sl) ? (read_pos63(sl) - (home_valid ? home_pos[sl] : start_pos[sl])) : 0;
       int32_t rv = (ctx.slavecount >= sl) ? read_vel(sl) : 0;
       pos[sl - 1] = (float)((double)dp * MM_PER_PULSE);         /* mm, 从 home 起 */
       vel[sl - 1] = (float)((double)rv / PULSE_PER_REV * 60.0); /* pulse/s → RPM */
    }
 
-   seq++;
    buf[0] = 0xAA; buf[1] = 0x55;
    memcpy(buf + 2, &seq, 4);
    buf[6] = (uint8_t)g_cur_mode;
@@ -457,13 +528,14 @@ static int estop_pressed(void)
 static void poll_cmd(void)
 {
    int ch;
-   while ((ch = uart_rx_getc()) >= 0)  feed_cmd_byte((char)ch);
-   while ((ch = usb_cdc_getc()) >= 0)  feed_cmd_byte((char)ch);
+   while ((ch = uart_rx_getc()) >= 0)  feed_cmd_byte((char)ch, 0);
+   while ((ch = usb_cdc_getc()) >= 0)  feed_cmd_byte((char)ch, 1);
    if (estop_pressed()) g_abort = 1;   /* 物理急停按钮: 和HMI线圈0x0006/串口'x'命令同级别, 共用g_abort */
    modbus_poll();            /* 收/解析/应答 Modbus 帧 */
    modbus_sync();            /* HMI 命令/参数 → 本地全局 */
    modbus_write_feedback();  /* 本地状态 → 反馈寄存器 */
    sensor_status_tx();       /* → PC6: 传感器接收状态 0/1 */
+   vt_report();
    twin_emit();              /* → micro-USB: 数字孪生遥测帧 */
 }
 
@@ -798,7 +870,7 @@ static int run_sensor_mode(void)
    float  r, p;
 
    g_abort = 0; g_ec_fault = 0;
-   g_status = 2; g_cur_mode = 6;   /* HMI 反馈: 运行中 + 模式6(传感器跟随) */
+   g_status = 6; g_cur_mode = 6;   /* HMI 反馈: 运行中 + 模式6(传感器跟随) */
    motion_reset();
    sensor_reset();                 /* 清解析层跳变历史 + 解锁数据源, 保证标定/跟随同源 */
 
@@ -952,6 +1024,7 @@ static void run_homing(void)
    int stall_cnt[EC_MAXSLAVE] = {0}, stopped[EC_MAXSLAVE] = {0};
    int32_t vel_cmd[EC_MAXSLAVE];
    int32_t pos_win[EC_MAXSLAVE];    /* 每轴去抖窗口起点位置(位置法堵转检测用) */
+   home_valid = 0; vt_have_target = 0;
    g_abort = 0; g_ec_fault = 0;
    g_status = 3; g_cur_mode = 99;   /* HMI 反馈: 归零中 */
 
@@ -1003,6 +1076,8 @@ static void run_homing(void)
       int all = 1;
       for (sl = 1; sl <= ctx.slavecount; sl++) if (!stopped[sl]) all = 0;
       if (all) {
+         for (sl=1;sl<=ctx.slavecount;sl++) home_pos[sl]=read_pos63(sl);
+         home_valid = ctx.slavecount == 3; vt_detail = 0; vt_report_pending = 1;
          uart_log(">>> 归零完成, 所有轴到位 <<<\r\n");
          log_screen_event(LOGPH_EV_HM_DONE, 0); log_screen_set_state(LOGPH_ST_IDLE);
          return;
@@ -1012,6 +1087,67 @@ static void run_homing(void)
    log_screen_event(LOGPH_EV_HM_TO, 1);
    log_screen_set_state(LOGPH_ST_IDLE);
    ramp_to_zero();
+}
+
+/* 单次定位模式：电脑心跳监测USB/桥接连接；Unity单次发包后静默不算失联。 */
+static void run_virtual_mode(void)
+{
+   g_do_home=0; g_do_sensor=0; g_run_request=-1; vt_have_target=0;
+   if(g_abort || !home_valid || ctx.slavecount!=3 || g_ec_fault || any_fault() || estop_pressed() || g_wkc!=9) {
+      vt_detail=5; vt_report_pending=1; return;
+   }
+   for(int sl=1;sl<=3;sl++) {
+      double p=(double)(read_pos63(sl)-home_pos[sl])*MM_PER_PULSE;
+      if(p < -DEADBAND*MM_PER_PULSE || p > VT_MAX_MM+DEADBAND*MM_PER_PULSE) {
+         vt_detail=6; vt_report_pending=1; return;
+      }
+      v_last[sl]=0;
+   }
+   vt_epoch++; vt_link_tick=HAL_GetTick(); vt_detail=1; vt_seq=0;
+   g_abort=0; g_status=7; g_cur_mode=7; vt_accepting=1; vt_report_pending=1;
+   log_screen_set_state(LOGPH_ST_RUN);
+   uart_log(">>> 以虚控实: 单次绝对定位, 0~130mm, 等待新目标 <<<\r\n");
+   for(;;) {
+      cycle(); poll_cmd(); log_screen_service();
+      int fault=any_fault();
+      if(fault || g_wkc!=9) { g_ec_fault=fault ? fault : 99; home_valid=0; vt_detail=7; break; }
+      if(g_abort || g_quit) break;
+      if((uint32_t)(HAL_GetTick()-vt_link_tick)>VT_LINK_MS) { vt_detail=4; break; }
+      int reached=vt_have_target;
+      for(int sl=1;sl<=3;sl++) {
+         double actual=(double)(read_pos63(sl)-home_pos[sl]);
+         if(actual < -DEADBAND || actual > VT_MAX_MM/MM_PER_PULSE+DEADBAND) {
+            vt_detail=6; g_abort=1; break;
+         }
+         double error=vt_have_target ? vt_target[sl-1]/MM_PER_PULSE-actual : 0;
+         double v=0;
+         if(vt_have_target && fabs(error)>DEADBAND) {
+            reached=0; v=KP_POS*error;
+            double brake=sqrt(2.0*AMAX*fabs(error));
+            if(v>brake) v=brake;
+            if(v< -brake) v= -brake;
+         }
+         if(fabs(v_last[sl])>DEADBAND) reached=0;
+         write_pdo(sl,0x000F,limit_out(sl,v));
+      }
+      if(g_abort) break;
+      if(reached && vt_detail!=3) { vt_detail=3; vt_report_pending=1; }
+   }
+   /* 先撤销目标受理并更换会话号，减速阶段的新包不能覆盖停止原因。 */
+   vt_accepting=0; vt_epoch++; vt_report_pending=1;
+   /* 受控减速到零，不执行归平/下降；再交回待机零速保持。 */
+   for(int i=0;i<RAMP_FRAMES;i++) {
+      int stopped=1;
+      for(int sl=1;sl<=3;sl++) {
+         int32_t v=limit_out(sl,0.0); write_pdo(sl,0x000F,v); if(v) stopped=0;
+      }
+      cycle(); poll_cmd(); log_screen_service(); if(stopped) break;
+   }
+   vt_have_target=0; g_do_home=0;g_do_sensor=0;g_run_request=-1;
+   if(vt_detail!=4 && vt_detail!=6 && vt_detail!=7) vt_detail=0;
+   g_cur_mode=99;g_status=g_ec_fault ? 4 : 1;vt_report_pending=1;
+   log_screen_set_state(g_ec_fault ? LOGPH_ST_FAULT : LOGPH_ST_IDLE);
+   uart_log(">>> 以虚控实退出: 减速保持, 未归平或下降 <<<\r\n");
 }
 
 /* ================= EtherCAT 启动(扫描→PDO→OP→使能) ================= */
@@ -1219,6 +1355,7 @@ void ecat_motion_run(void)
    while (!g_quit) {
       g_status = g_ec_fault ? 4 : 1;   /* HMI 反馈: 故障未清则4, 否则待机1 */
       g_cur_mode = 99;
+      g_abort = 0;
       for (sl = 1; sl <= ctx.slavecount; sl++) write_pdo(sl, 0x000F, 0);
       { float _r, _p; sensor_get(&_r, &_p); }   /* 待机也驱动校验计数,供 Bridge 诊断 */
       cycle();
@@ -1233,7 +1370,8 @@ void ecat_motion_run(void)
                   (unsigned long)modbus_stat_frames, (unsigned long)modbus_stat_valid);
       }
 
-      if (g_do_home)          { g_do_home = 0; g_do_sensor = 0; g_run_request = -1; run_homing(); uart_log(">>> 回待机 <<<\r\n"); }
+      if (g_do_home)          { g_do_home = 0; g_do_sensor = 0; g_do_virtual = 0; g_run_request = -1; run_homing(); uart_log(">>> 回待机 <<<\r\n"); }
+      else if (g_do_virtual) { g_do_virtual=0; run_virtual_mode(); }
       else if (g_do_sensor)   { g_do_sensor = 0; g_run_request = -1; run_sensor_mode(); uart_log(">>> 回待机 <<<\r\n"); }
       else if (g_run_request >= 0) { int m = g_run_request; g_run_request = -1; g_do_home = 0; run_rehab_mode(m); uart_log(">>> 回待机 <<<\r\n"); }
    }
