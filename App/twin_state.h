@@ -16,6 +16,29 @@ typedef struct {
    enum reference_reason reason;
 } twin_reference_t;
 
+/* VC1诊断位：同一份判断用于模式入口和电脑条件表，避免显示与实际准入脱节。 */
+enum twin_blocker {
+   TB_BUSY=1u, TB_STOP=2u, TB_QUIT=4u, TB_ESTOP=8u,
+   TB_AXES=16u, TB_WKC=32u, TB_FAULT=64u, TB_ALARM=128u,
+   TB_REFERENCE=256u, TB_POS1=512u, TB_POS2=1024u, TB_POS3=2048u
+};
+static inline unsigned twin_blockers(int status, int mode, int stop, int quit,
+   int estop, int axes, int wkc, int fault, unsigned alarms,
+   int reference_valid, unsigned position_errors)
+{
+   unsigned mask=0;
+   if (status!=1 && !(status==7 && mode==7)) mask|=TB_BUSY;
+   if (stop) mask|=TB_STOP;
+   if (quit) mask|=TB_QUIT;
+   if (estop) mask|=TB_ESTOP;
+   if (axes!=3) mask|=TB_AXES;
+   if (wkc!=9) mask|=TB_WKC;
+   if (fault) mask|=TB_FAULT;
+   if (alarms) mask|=TB_ALARM;
+   if (!reference_valid) mask|=TB_REFERENCE;
+   return mask | ((position_errors & 7u)<<9);
+}
+
 static inline void twin_reference_invalidate(twin_reference_t *r,
                                              enum reference_reason reason)
 {

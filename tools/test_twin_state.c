@@ -16,6 +16,11 @@ int twin_state_contract_test(void)
    CHECK(!twin_start_allowed(1, 1, 0)); /* Stop and start in the same poll. */
    CHECK(!twin_start_allowed(1, 0, 1)); /* Shutdown and start in the same poll. */
    CHECK(!twin_start_allowed(7, 0, 0)); /* No competing mode while running. */
+   CHECK(twin_blockers(1,99,0,0,0,3,9,0,0,1,0)==0);
+   CHECK(twin_blockers(7,7,0,0,0,3,9,0,0,1,0)==0);
+   CHECK(twin_blockers(1,99,0,0,0,2,6,0,0,0,0)==(TB_AXES|TB_WKC|TB_REFERENCE));
+   CHECK(twin_blockers(2,0,1,1,1,3,9,99,5,1,5)==
+      (TB_BUSY|TB_STOP|TB_QUIT|TB_ESTOP|TB_FAULT|TB_ALARM|TB_POS1|TB_POS3));
    CHECK(!twin_reference_observe(&ref, 1, 0));
    CHECK(!ref.valid);                  /* Healthy feedback alone cannot home. */
    twin_reference_establish(&ref);

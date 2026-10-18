@@ -172,6 +172,9 @@ static float vt_target[3];
 static int vt_have_target = 0, vt_detail = 0, vt_report_pending = 1, vt_accepting = 0;
 #define VT_MAX_MM 130.0
 #define VT_LINK_MS (SENSOR_NEUTRAL_FRAMES * CYC_US / 1000)
+static unsigned vt_entry_blockers=0;
+static uint32_t vt_entry_rejections=0;
+static unsigned vt_diagnostic(long positions_um[3], unsigned *alarms);
 
 static void reference_invalidate(enum reference_reason reason)
 {
@@ -224,12 +227,18 @@ static void vt_command(const char *line)
 }
 static void vt_report(void)
 {
-   static char tx[96]; static uint32_t last=0;
+   static char tx[256]; static uint32_t last=0;
    uint32_t now=HAL_GetTick();
    if ((!vt_report_pending && now-last<500) || !usb_cdc_tx_ready()) return;
-   int n=snprintf(tx,sizeof tx,"VT1 %lu %d %d %lu %d\r\nVR1 %d\r\n",(unsigned long)vt_epoch,
+   long positions[3]; unsigned alarms;
+   unsigned blockers=vt_diagnostic(positions,&alarms);
+   int n=snprintf(tx,sizeof tx,"VT1 %lu %d %d %lu %d\r\nVR1 %d\r\n"
+      "VC1 %u %u %lu %d %d %d %u %d %d %ld %ld %ld %ld\r\n",(unsigned long)vt_epoch,
       vt_accepting,vt_detail,(unsigned long)vt_seq,position_reference.valid,
-      (int)position_reference.reason);
+      (int)position_reference.reason, blockers,vt_entry_blockers,
+      (unsigned long)vt_entry_rejections,ctx.slavecount,g_wkc,g_ec_fault,
+      alarms,g_status,g_cur_mode,positions[0],positions[1],positions[2],
+      (long)(DEADBAND*MM_PER_PULSE*1000.0));
    if(n>0 && CDC_Transmit_FS((uint8_t *)tx,(uint16_t)n)==USBD_OK) {
       vt_report_pending=0; last=now;
    }
@@ -528,6 +537,25 @@ static int estop_pressed(void)
    int no_active = (HAL_GPIO_ReadPin(ESTOP_NO_PORT, ESTOP_NO_PIN) == GPIO_PIN_RESET);
    int nc_active = (HAL_GPIO_ReadPin(ESTOP_NC_PORT, ESTOP_NC_PIN) == GPIO_PIN_SET);
    return no_active || nc_active;
+}
+
+static unsigned vt_diagnostic(long positions_um[3], unsigned *alarms)
+{
+   unsigned position_errors=0;
+   *alarms=0;
+   for (int sl=1;sl<=3;sl++) {
+      positions_um[sl-1]=0;
+      if (ctx.slavecount<sl) continue;
+      if (read_sw(sl)&0x0008) *alarms|=1u<<(sl-1);
+      if (!position_reference.established) continue;
+      double p=(double)(read_pos63(sl)-reference_pos[sl])*MM_PER_PULSE;
+      positions_um[sl-1]=(long)(p*1000.0);
+      if (position_reference.valid && g_wkc==9 && ctx.slavecount==3 &&
+          (p < -DEADBAND*MM_PER_PULSE || p > VT_MAX_MM+DEADBAND*MM_PER_PULSE))
+         position_errors|=1u<<(sl-1);
+   }
+   return twin_blockers(g_status,g_cur_mode,g_abort,g_quit,estop_pressed(),
+      ctx.slavecount,g_wkc,g_ec_fault,*alarms,position_reference.valid,position_errors);
 }
 
 /* 非阻塞轮询命令通道: USART1(CH340)、USB Slave(虚拟串口)、Modbus/HMI(USART3)、
@@ -1121,19 +1149,15 @@ static void run_homing(void)
 static void run_virtual_mode(void)
 {
    g_do_home=0; g_do_sensor=0; g_run_request=-1; vt_have_target=0;
-   int entry = twin_entry_detail(!g_abort && !g_quit && ctx.slavecount==3 &&
-      !g_ec_fault && !any_fault() && !estop_pressed() && g_wkc==9,
-      position_reference.valid);
-   if(entry != VT_OFF) {
-      vt_detail=entry; vt_report_pending=1; return;
+   long positions[3]; unsigned alarms;
+   unsigned blockers=vt_diagnostic(positions,&alarms);
+   if(blockers) {
+      vt_entry_blockers=blockers; vt_entry_rejections++;
+      vt_detail=(blockers & ~(TB_REFERENCE|TB_POS1|TB_POS2|TB_POS3)) ? VT_NOT_READY :
+         ((blockers & TB_REFERENCE) ? VT_NEEDS_REFERENCE : VT_REJECTED);
+      vt_report_pending=1; return;
    }
-   for(int sl=1;sl<=3;sl++) {
-      double p=(double)(read_pos63(sl)-reference_pos[sl])*MM_PER_PULSE;
-      if(p < -DEADBAND*MM_PER_PULSE || p > VT_MAX_MM+DEADBAND*MM_PER_PULSE) {
-         vt_detail=6; vt_report_pending=1; return;
-      }
-      v_last[sl]=0;
-   }
+   for(int sl=1;sl<=3;sl++) v_last[sl]=0;
    vt_epoch++; vt_link_tick=HAL_GetTick(); vt_detail=1; vt_seq=0;
    g_abort=0; g_status=7; g_cur_mode=7; vt_accepting=1; vt_report_pending=1;
    log_screen_set_state(LOGPH_ST_RUN);
