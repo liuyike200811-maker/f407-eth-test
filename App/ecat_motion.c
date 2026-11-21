@@ -22,7 +22,7 @@
  * ⚠ 未做 DC 同步, 信捷 DS5C1 在 CSV 下自由运行(free-run)。实测单轴最大行程
  *   约159mm(见探测标定), 上升高度+运动幅度务必留余量; 建议每次运动前先 h 归零。
  *
- * 急停来源共3路, 同级别(谁先触发都直接置 g_abort=1): 串口'x'命令 / HMI线圈0x0006 /
+ * 通用急停来源共4类, 同级别: 摄像头 PAIN=1 / 串口'x'命令 / HMI线圈0x0006 /
  * PB12+PB13物理按钮(常开+常闭双通道互相校验, 见 estop_pressed())。
  */
 #include "soem/soem.h"
@@ -368,12 +368,45 @@ static void handle_cmd(char *line)
    }
 }
 
-/* 把一个字节喂进行缓冲区, 攒够一行(\r或\n)就解析。USART1/USB两路共用同一份逻辑。 */
+static enum { PAIN_REPLY_NONE, PAIN_REPLY_READY, PAIN_REPLY_ACK } pain_reply;
+static char pain_reply_id[9];
+
+static int pain_command(const char *line)
+{
+   int alert = strncmp(line, "PAIN=1 ", 7) == 0;
+   int probe = strncmp(line, "PAIN? ", 6) == 0;
+   if (!alert && !probe) return 0;
+   const char *id = line + (alert ? 7 : 6);
+   if (strlen(id) != 8) return 1;
+   for (int i = 0; i < 8; ++i)
+      if (vt_hex(id[i]) < 0) return 1;
+   if (alert) g_abort = 1;
+   if (alert || pain_reply != PAIN_REPLY_ACK) {
+      memcpy(pain_reply_id, id, sizeof pain_reply_id);
+      pain_reply = alert ? PAIN_REPLY_ACK : PAIN_REPLY_READY;
+   }
+   return 1;
+}
+
+static void pain_report(void)
+{
+   static char tx[32];
+   if (pain_reply == PAIN_REPLY_NONE || !usb_cdc_tx_ready()) return;
+   int n = snprintf(tx, sizeof tx, "\nPAIN/1 %s %s\n",
+                    pain_reply == PAIN_REPLY_ACK ? "ACK" : "READY", pain_reply_id);
+   if (CDC_Transmit_FS((uint8_t *)tx, (uint16_t)n) == USBD_OK)
+      pain_reply = PAIN_REPLY_NONE;
+}
+
+/* 攒够一行再解析。摄像头命令只走原生 USB，普通命令两路共用。 */
 static void feed_cmd_byte(char ch, int channel)
 {
    static char buf[2][96]; static int len[2], discard[2];
    if(ch=='\r' || ch=='\n') {
-      if(!discard[channel] && len[channel]>0) { buf[channel][len[channel]]=0; handle_cmd(buf[channel]); }
+      if (!discard[channel] && len[channel] > 0) {
+         buf[channel][len[channel]] = 0;
+         if (channel != 1 || !pain_command(buf[channel])) handle_cmd(buf[channel]);
+      }
       len[channel]=0; discard[channel]=0;
    } else if(!discard[channel]) {
       if(len[channel] < 95) buf[channel][len[channel]++]=ch;
@@ -566,6 +599,7 @@ static void poll_cmd(void)
    int ch;
    while ((ch = uart_rx_getc()) >= 0)  feed_cmd_byte((char)ch, 0);
    while ((ch = usb_cdc_getc()) >= 0)  feed_cmd_byte((char)ch, 1);
+   pain_report();
    if (estop_pressed()) g_abort = 1;   /* 物理急停按钮: 和HMI线圈0x0006/串口'x'命令同级别, 共用g_abort */
    modbus_poll();            /* 收/解析/应答 Modbus 帧 */
    modbus_sync();            /* HMI 命令/参数 → 本地全局 */
